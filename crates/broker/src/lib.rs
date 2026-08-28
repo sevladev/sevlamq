@@ -30,6 +30,7 @@ pub async fn run(config: &BrokerConfig) -> Result<(), BrokerError> {
         PathBuf::from(&config.data_dir),
         config.max_segment_bytes,
         config.index_interval_bytes,
+        config.default_partition_count,
     )
     .await?;
     let listener = TcpListener::bind(address).await?;
@@ -104,20 +105,22 @@ async fn handle_connection(
                         payload_bytes = request.payload().len(),
                         "produce received"
                     );
-                    let offset = storage
+                    let ack = storage
                         .append(
                             request.topic().to_owned(),
                             request.key().clone(),
                             request.payload().clone(),
                         )
                         .await?;
-                    encode_response(
-                        &Response::ProduceAck(ProduceAck {
-                            partition: 0,
-                            offset,
-                        }),
-                        &mut write_buffer,
-                    )?;
+                    debug!(
+                        connection_id,
+                        %peer,
+                        topic = %request.topic(),
+                        partition = ack.partition,
+                        offset = ack.offset,
+                        "produce appended"
+                    );
+                    encode_response(&Response::ProduceAck(ack), &mut write_buffer)?;
                     stream.write_all(&write_buffer).await?;
                     write_buffer.clear();
                 }
@@ -165,7 +168,7 @@ impl StorageHandle {
         topic: String,
         key: Bytes,
         value: Bytes,
-    ) -> Result<u64, ConnectionError> {
+    ) -> Result<ProduceAck, ConnectionError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(StorageCommand::Append {
@@ -212,7 +215,7 @@ enum StorageCommand {
         topic: String,
         key: Bytes,
         value: Bytes,
-        reply: oneshot::Sender<Result<u64, sevlamq_storage::StorageError>>,
+        reply: oneshot::Sender<Result<ProduceAck, sevlamq_storage::StorageError>>,
     },
     Read {
         topic: String,
@@ -227,6 +230,7 @@ struct StorageSettings {
     data_dir: PathBuf,
     max_segment_bytes: u64,
     index_interval_bytes: u64,
+    default_partition_count: u32,
 }
 
 type PartitionKey = (String, u32);
@@ -236,6 +240,7 @@ async fn start_storage_worker(
     data_dir: PathBuf,
     max_segment_bytes: u64,
     index_interval_bytes: u64,
+    default_partition_count: u32,
 ) -> Result<
     (
         StorageHandle,
@@ -243,15 +248,20 @@ async fn start_storage_worker(
     ),
     BrokerError,
 > {
+    if default_partition_count == 0 {
+        return Err(BrokerError::InvalidPartitionCount);
+    }
     let settings = StorageSettings {
         data_dir,
         max_segment_bytes,
         index_interval_bytes,
+        default_partition_count,
     };
     let (settings, mut logs) =
         tokio::task::spawn_blocking(move || recover_storage(settings)).await??;
     let (sender, mut receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
     let worker = tokio::task::spawn_blocking(move || {
+        let mut round_robin = HashMap::<String, u32>::new();
         while let Some(command) = receiver.blocking_recv() {
             match command {
                 StorageCommand::Append {
@@ -260,7 +270,8 @@ async fn start_storage_worker(
                     value,
                     reply,
                 } => {
-                    let result = append_record(&settings, &mut logs, &topic, key, value);
+                    let result =
+                        append_record(&settings, &mut logs, &mut round_robin, &topic, key, value);
                     let _ = reply.send(result);
                 }
                 StorageCommand::Read {
@@ -283,13 +294,20 @@ async fn start_storage_worker(
 
 fn recover_storage(
     settings: StorageSettings,
-) -> Result<(StorageSettings, PartitionLogs), sevlamq_storage::StorageError> {
+) -> Result<(StorageSettings, PartitionLogs), BrokerError> {
     let identities = discover_partitions(&settings.data_dir)?;
     let mut logs = HashMap::with_capacity(identities.len());
 
     for identity in identities {
         let topic = identity.topic().to_owned();
         let partition = identity.partition();
+        if partition >= settings.default_partition_count {
+            return Err(BrokerError::PartitionOutsideConfiguredRange {
+                topic,
+                partition,
+                partition_count: settings.default_partition_count,
+            });
+        }
         let log = PartitionLog::open(
             &settings.data_dir,
             &topic,
@@ -314,23 +332,14 @@ fn recover_storage(
 fn append_record(
     settings: &StorageSettings,
     logs: &mut PartitionLogs,
+    round_robin: &mut HashMap<String, u32>,
     topic: &str,
     key: Bytes,
     value: Bytes,
-) -> Result<u64, sevlamq_storage::StorageError> {
-    let partition_key = (topic.to_owned(), 0);
-    if !logs.contains_key(&partition_key) {
-        logs.insert(
-            partition_key.clone(),
-            PartitionLog::open(
-                &settings.data_dir,
-                topic,
-                0,
-                settings.max_segment_bytes,
-                settings.index_interval_bytes,
-            )?,
-        );
-    }
+) -> Result<ProduceAck, sevlamq_storage::StorageError> {
+    ensure_topic_partitions(settings, logs, topic)?;
+    let partition = select_partition(settings.default_partition_count, round_robin, topic, &key);
+    let partition_key = (topic.to_owned(), partition);
     let log = logs
         .get_mut(&partition_key)
         .ok_or(sevlamq_storage::StorageError::InvalidTopic)?;
@@ -342,7 +351,44 @@ fn append_record(
     )
     .map_err(|_| sevlamq_storage::StorageError::InvalidTimestamp)?;
     let key = (!key.is_empty()).then_some(key);
-    log.append(&Record::new(key, value, timestamp_ms))
+    let offset = log.append(&Record::new(key, value, timestamp_ms))?;
+    Ok(ProduceAck { partition, offset })
+}
+
+fn ensure_topic_partitions(
+    settings: &StorageSettings,
+    logs: &mut PartitionLogs,
+    topic: &str,
+) -> Result<(), sevlamq_storage::StorageError> {
+    for partition in 0..settings.default_partition_count {
+        let partition_key = (topic.to_owned(), partition);
+        if let std::collections::hash_map::Entry::Vacant(entry) = logs.entry(partition_key) {
+            entry.insert(PartitionLog::open(
+                &settings.data_dir,
+                topic,
+                partition,
+                settings.max_segment_bytes,
+                settings.index_interval_bytes,
+            )?);
+        }
+    }
+    Ok(())
+}
+
+fn select_partition(
+    partition_count: u32,
+    round_robin: &mut HashMap<String, u32>,
+    topic: &str,
+    key: &Bytes,
+) -> u32 {
+    if !key.is_empty() {
+        return crc32fast::hash(key) % partition_count;
+    }
+
+    let next = round_robin.entry(topic.to_owned()).or_default();
+    let partition = *next;
+    *next = (*next + 1) % partition_count;
+    partition
 }
 
 fn read_records(
@@ -410,6 +456,16 @@ pub enum BrokerError {
     Storage(#[from] sevlamq_storage::StorageError),
     #[error("storage worker failed: {0}")]
     StorageWorker(#[from] tokio::task::JoinError),
+    #[error("default partition count must be greater than zero")]
+    InvalidPartitionCount,
+    #[error(
+        "topic {topic} has partition {partition}, outside configured partition count {partition_count}"
+    )]
+    PartitionOutsideConfiguredRange {
+        topic: String,
+        partition: u32,
+        partition_count: u32,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -429,7 +485,7 @@ enum ConnectionError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{collections::HashMap, fs, time::Duration};
 
     use bytes::Bytes;
     use sevlamq_client::Client;
@@ -437,7 +493,21 @@ mod tests {
     use tempfile::tempdir;
     use tokio::{net::TcpListener, time::timeout};
 
-    use super::{handle_connection, start_storage_worker};
+    use super::{handle_connection, select_partition, start_storage_worker};
+
+    #[test]
+    fn selects_partitions_deterministically_and_round_robins_unkeyed_messages() {
+        let mut round_robin = HashMap::new();
+        let key = Bytes::from_static(b"customer-123");
+
+        assert_eq!(select_partition(3, &mut round_robin, "payments", &key), 1);
+        assert_eq!(select_partition(3, &mut round_robin, "payments", &key), 1);
+
+        let selected: Vec<u32> = (0..4)
+            .map(|_| select_partition(3, &mut round_robin, "payments", &Bytes::new()))
+            .collect();
+        assert_eq!(selected, [0, 1, 2, 0]);
+    }
 
     #[tokio::test]
     async fn recovers_existing_partitions_before_starting_worker() {
@@ -452,9 +522,10 @@ mod tests {
         };
         fs::write(&index_path, b"broken index").expect("index should be corrupted");
 
-        let (storage, storage_worker) = start_storage_worker(data_dir.path().to_owned(), 1024, 64)
-            .await
-            .expect("storage recovery should complete");
+        let (storage, storage_worker) =
+            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3)
+                .await
+                .expect("storage recovery should complete");
 
         assert_eq!(
             fs::metadata(index_path)
@@ -480,7 +551,7 @@ mod tests {
                 .expect("listener should have an address");
             let data_dir = tempdir().expect("temporary directory should be created");
             let (storage, storage_worker) =
-                start_storage_worker(data_dir.path().to_owned(), 1024, 64)
+                start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3)
                     .await
                     .expect("storage worker should start");
             let connection_storage = storage.clone();
@@ -492,6 +563,7 @@ mod tests {
             let mut client = Client::connect(address)
                 .await
                 .expect("client should connect");
+            let mut selected_partition = None;
             for (expected_offset, value) in ["zero", "one", "two"].into_iter().enumerate() {
                 let ack = client
                     .produce(
@@ -501,15 +573,32 @@ mod tests {
                     )
                     .await
                     .expect("broker should acknowledge produce");
-                assert_eq!(ack.partition, 0);
+                assert_eq!(
+                    *selected_partition.get_or_insert(ack.partition),
+                    ack.partition
+                );
                 assert_eq!(
                     ack.offset,
                     u64::try_from(expected_offset).expect("offset should fit in u64")
                 );
             }
 
+            for partition in 0..3 {
+                assert!(
+                    data_dir
+                        .path()
+                        .join("payments")
+                        .join(partition.to_string())
+                        .is_dir()
+                );
+            }
             let response = client
-                .fetch("payments".to_owned(), 0, 1, 1024)
+                .fetch(
+                    "payments".to_owned(),
+                    selected_partition.expect("partition should be selected"),
+                    1,
+                    1024,
+                )
                 .await
                 .expect("broker should return records");
             assert_eq!(response.records().len(), 2);

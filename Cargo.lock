@@ -370,6 +370,7 @@ name = "sevlamq-broker"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "crc32fast",
  "sevlamq-client",
  "sevlamq-common",
  "sevlamq-protocol",

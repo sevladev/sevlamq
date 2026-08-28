@@ -15,6 +15,7 @@ pub struct BrokerConfig {
     pub data_dir: String,
     pub max_segment_bytes: u64,
     pub index_interval_bytes: u64,
+    pub default_partition_count: u32,
 }
 
 impl Config {
@@ -57,6 +58,7 @@ mod tests {
                 data_dir = "./data"
                 max_segment_bytes = 268435456
                 index_interval_bytes = 4096
+                default_partition_count = 3
             "#,
         )
         .expect("configuration should be valid");
@@ -66,6 +68,7 @@ mod tests {
         assert_eq!(config.broker.data_dir, "./data");
         assert_eq!(config.broker.max_segment_bytes, 268_435_456);
         assert_eq!(config.broker.index_interval_bytes, 4096);
+        assert_eq!(config.broker.default_partition_count, 3);
         assert_eq!(
             config.broker.socket_addr().expect("address should parse"),
             "127.0.0.1:7400".parse().expect("test address should parse")

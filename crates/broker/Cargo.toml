@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 bytes.workspace = true
+crc32fast.workspace = true
 sevlamq-common = { path = "../common" }
 sevlamq-protocol = { path = "../protocol" }
 sevlamq-storage = { path = "../storage" }
