@@ -56,6 +56,11 @@ pub enum Command {
         #[command(subcommand)]
         command: GroupCommand,
     },
+    /// Creates and inspects topic metadata.
+    Topic {
+        #[command(subcommand)]
+        command: TopicCommand,
+    },
     /// Runs a coordinated consumer with automatic heartbeat and commits.
     Consume {
         topic: String,
@@ -157,12 +162,25 @@ pub enum GroupCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum TopicCommand {
+    Create {
+        topic: String,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        partitions: u32,
+    },
+    List,
+    Describe {
+        topic: String,
+    },
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use clap::Parser;
 
-    use super::{BatchCompression, Cli, Command, GroupCommand};
+    use super::{BatchCompression, Cli, Command, GroupCommand, TopicCommand};
 
     #[test]
     fn parses_produce_command() {
@@ -222,6 +240,23 @@ mod tests {
                 max_bytes: 1_048_576,
                 wait_ms: 0,
             } if topic == "payments"
+        ));
+    }
+
+    #[test]
+    fn parses_topic_create() {
+        let cli =
+            Cli::try_parse_from(["sevlamq", "topic", "create", "orders", "--partitions", "6"])
+                .expect("topic create should parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::Topic {
+                command: TopicCommand::Create {
+                    topic,
+                    partitions: 6,
+                }
+            } if topic == "orders"
         ));
     }
 

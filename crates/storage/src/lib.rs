@@ -388,6 +388,49 @@ impl PartitionLog {
         self.segments.iter().map(SegmentMetadata::len).sum()
     }
 
+    #[must_use]
+    pub fn low_watermark(&self) -> u64 {
+        self.segments
+            .first()
+            .map_or(self.next_offset, SegmentMetadata::base_offset)
+    }
+
+    pub fn apply_retention(
+        &mut self,
+        max_bytes: Option<u64>,
+        max_age: Option<std::time::Duration>,
+    ) -> Result<usize, StorageError> {
+        let mut removed = 0;
+        let mut total_bytes = self.log_size_bytes();
+        while self.segments.len() > 1 {
+            let segment = &self.segments[0];
+            let over_size = max_bytes.is_some_and(|limit| total_bytes > limit);
+            let expired = if let Some(age) = max_age {
+                segment
+                    .path
+                    .metadata()?
+                    .modified()?
+                    .elapsed()
+                    .is_ok_and(|elapsed| elapsed >= age)
+            } else {
+                false
+            };
+            if !over_size && !expired {
+                break;
+            }
+            let segment = self.segments[0].clone();
+            fs::remove_file(index_path(&segment.path))?;
+            fs::remove_file(&segment.path)?;
+            self.segments.remove(0);
+            total_bytes = total_bytes.saturating_sub(segment.len);
+            removed += 1;
+        }
+        if removed > 0 {
+            File::open(&self.partition_dir)?.sync_all()?;
+        }
+        Ok(removed)
+    }
+
     fn rotate(&mut self) -> Result<(), StorageError> {
         self.active_file.flush()?;
         self.active_index_file.flush()?;
@@ -766,6 +809,10 @@ pub enum StorageError {
     UnsupportedVersion(u8),
     #[error("topic name is invalid")]
     InvalidTopic,
+    #[error("topic already exists")]
+    TopicAlreadyExists,
+    #[error("topic does not exist")]
+    UnknownTopic,
     #[error("producer id is invalid")]
     InvalidProducerId,
     #[error("producer {producer_id} expected sequence {expected}, received {actual}")]
@@ -1084,5 +1131,31 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].offset(), 1);
         assert_eq!(records[1].offset(), 2);
+    }
+
+    #[test]
+    fn retention_removes_only_closed_segments_and_advances_low_watermark() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 55, 64)
+            .expect("partition log should be created");
+        for value in ["zero", "one", "two"] {
+            log.append(&Record::new(
+                None,
+                Bytes::copy_from_slice(value.as_bytes()),
+                1,
+            ))
+            .expect("append should work");
+        }
+        assert_eq!(log.segments().len(), 3);
+
+        let removed = log
+            .apply_retention(Some(55), None)
+            .expect("retention should succeed");
+        let records = log.read(0, 1024).expect("retained records should read");
+
+        assert_eq!(removed, 2);
+        assert_eq!(log.low_watermark(), 2);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset(), 2);
     }
 }

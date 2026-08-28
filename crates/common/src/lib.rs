@@ -34,6 +34,8 @@ pub struct BrokerConfig {
     pub index_interval_bytes: u64,
     pub default_partition_count: u32,
     pub group_session_timeout_ms: u64,
+    pub retention_bytes: u64,
+    pub retention_ms: u64,
 }
 
 impl Config {
@@ -88,6 +90,8 @@ mod tests {
                 index_interval_bytes = 4096
                 default_partition_count = 3
                 group_session_timeout_ms = 10000
+                retention_bytes = 0
+                retention_ms = 0
             "#,
         )
         .expect("configuration should be valid");
@@ -99,6 +103,8 @@ mod tests {
         assert_eq!(config.broker.index_interval_bytes, 4096);
         assert_eq!(config.broker.default_partition_count, 3);
         assert_eq!(config.broker.group_session_timeout_ms, 10_000);
+        assert_eq!(config.broker.retention_bytes, 0);
+        assert_eq!(config.broker.retention_ms, 0);
         assert_eq!(config.admin, super::AdminConfig::default());
         assert_eq!(
             config.broker.socket_addr().expect("address should parse"),

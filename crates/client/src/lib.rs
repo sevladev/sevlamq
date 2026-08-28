@@ -2,10 +2,10 @@ use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
 use sevlamq_protocol::{
-    AckMode, CommitOffsetRequest, FetchCommittedOffsetRequest, FetchRequest, FetchResponse,
-    GroupFetchRequest, GroupGenerationRequest, GroupMemberRequest, JoinGroupResponse, ProduceAck,
-    ProduceBatchRequest, ProduceRequest, ProducerIdentity, Request, Response, decode_response,
-    encode_request,
+    AckMode, CommitOffsetRequest, CreateTopicRequest, FetchCommittedOffsetRequest, FetchRequest,
+    FetchResponse, GroupFetchRequest, GroupGenerationRequest, GroupMemberRequest,
+    JoinGroupResponse, ProduceAck, ProduceBatchRequest, ProduceRequest, ProducerIdentity, Request,
+    Response, TopicMetadata, decode_response, encode_request,
 };
 use thiserror::Error;
 use tokio::{
@@ -52,6 +52,37 @@ impl Client {
     ) -> Result<Vec<ProduceAck>, ClientError> {
         match self.request(Request::ProduceBatch(request)).await? {
             Response::ProduceBatchAck(acks) => Ok(acks),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn create_topic(
+        &mut self,
+        topic: String,
+        partitions: u32,
+    ) -> Result<TopicMetadata, ClientError> {
+        match self
+            .request(Request::CreateTopic(CreateTopicRequest {
+                topic,
+                partitions,
+            }))
+            .await?
+        {
+            Response::Topics(mut topics) if topics.len() == 1 => Ok(topics.remove(0)),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn list_topics(&mut self) -> Result<Vec<TopicMetadata>, ClientError> {
+        match self.request(Request::ListTopics).await? {
+            Response::Topics(topics) => Ok(topics),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn describe_topic(&mut self, topic: String) -> Result<TopicMetadata, ClientError> {
+        match self.request(Request::DescribeTopic(topic)).await? {
+            Response::Topics(mut topics) if topics.len() == 1 => Ok(topics.remove(0)),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

@@ -11,7 +11,8 @@ use thiserror::Error;
 
 pub struct GroupCoordinator {
     offsets_dir: PathBuf,
-    partition_count: u32,
+    default_partition_count: u32,
+    topic_partition_counts: HashMap<String, u32>,
     session_timeout: Duration,
     groups: HashMap<(String, String), ConsumerGroup>,
 }
@@ -44,7 +45,8 @@ impl GroupCoordinator {
         let groups = recover_groups(&offsets_dir, partition_count)?;
         Ok(Self {
             offsets_dir,
-            partition_count,
+            default_partition_count: partition_count,
+            topic_partition_counts: HashMap::new(),
             session_timeout,
             groups,
         })
@@ -59,11 +61,12 @@ impl GroupCoordinator {
         validate_id(group)?;
         validate_id(topic)?;
         validate_id(member)?;
+        let partition_count = self.partition_count(topic);
         let key = (group.to_owned(), topic.to_owned());
         let committed_offsets = if self.groups.contains_key(&key) {
             HashMap::new()
         } else {
-            load_offsets(&self.offsets_dir, group, topic, self.partition_count)?
+            load_offsets(&self.offsets_dir, group, topic, partition_count)?
         };
         let consumer_group = self.groups.entry(key).or_insert_with(|| ConsumerGroup {
             generation: 0,
@@ -77,7 +80,7 @@ impl GroupCoordinator {
             .insert(member.to_owned(), Instant::now())
             .is_none();
         if is_new || members_expired || consumer_group.generation == 0 {
-            rebalance(consumer_group, self.partition_count)?;
+            rebalance(consumer_group, partition_count)?;
         }
         Ok(JoinGroupResponse::new(
             consumer_group.generation,
@@ -111,7 +114,7 @@ impl GroupCoordinator {
         member: &str,
         generation: u64,
     ) -> Result<(), GroupError> {
-        let partition_count = self.partition_count;
+        let partition_count = self.partition_count(topic);
         let consumer_group = self.active_group(group, topic)?;
         validate_member(consumer_group, member, generation)?;
         consumer_group.members.remove(member);
@@ -183,12 +186,41 @@ impl GroupCoordinator {
     }
 
     pub fn expire_sessions(&mut self) -> Result<(), GroupError> {
-        for group in self.groups.values_mut() {
+        let partition_counts = &self.topic_partition_counts;
+        let default_partition_count = self.default_partition_count;
+        for ((_, topic), group) in &mut self.groups {
             if expire_members(group, self.session_timeout) {
-                rebalance(group, self.partition_count)?;
+                let count = partition_counts
+                    .get(topic)
+                    .copied()
+                    .unwrap_or(default_partition_count);
+                rebalance(group, count)?;
             }
         }
         Ok(())
+    }
+
+    pub fn set_topic_partitions(&mut self, topic: &str, partitions: u32) -> Result<(), GroupError> {
+        self.topic_partition_counts
+            .insert(topic.to_owned(), partitions);
+        for ((group, group_topic), state) in &mut self.groups {
+            if group_topic == topic {
+                state.committed_offsets.extend(load_offsets(
+                    &self.offsets_dir,
+                    group,
+                    group_topic,
+                    partitions,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    fn partition_count(&self, topic: &str) -> u32 {
+        self.topic_partition_counts
+            .get(topic)
+            .copied()
+            .unwrap_or(self.default_partition_count)
     }
 
     #[must_use]
@@ -220,12 +252,13 @@ impl GroupCoordinator {
     }
 
     fn active_group(&mut self, group: &str, topic: &str) -> Result<&mut ConsumerGroup, GroupError> {
+        let partition_count = self.partition_count(topic);
         let consumer_group = self
             .groups
             .get_mut(&(group.to_owned(), topic.to_owned()))
             .ok_or(GroupError::UnknownGroup)?;
         if expire_members(consumer_group, self.session_timeout) {
-            rebalance(consumer_group, self.partition_count)?;
+            rebalance(consumer_group, partition_count)?;
         }
         Ok(consumer_group)
     }

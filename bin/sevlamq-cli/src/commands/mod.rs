@@ -10,6 +10,7 @@ mod fetch;
 mod group;
 mod produce;
 mod retry;
+mod topic;
 
 pub async fn execute(cli: Cli) -> Result<(), CliError> {
     match cli.command {
@@ -97,6 +98,7 @@ async fn execute_single(broker: std::net::SocketAddr, command: Command) -> Resul
             wait_ms,
         } => fetch::execute(&mut client, topic, partition, offset, max_bytes, wait_ms).await,
         Command::Group { command } => group::execute(&mut client, command).await,
+        Command::Topic { command } => topic::execute(&mut client, command).await,
         Command::Consume { .. } => unreachable!("consume has a dedicated execution path"),
     }
 }

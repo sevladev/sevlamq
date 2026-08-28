@@ -27,6 +27,10 @@ const GROUP_ACK: u8 = 0x26;
 const COMMITTED_OFFSET_RESPONSE: u8 = 0x27;
 const ERROR_RESPONSE: u8 = 0x7f;
 const GROUP_FETCH: u8 = 0x28;
+const CREATE_TOPIC: u8 = 0x30;
+const LIST_TOPICS: u8 = 0x31;
+const DESCRIBE_TOPIC: u8 = 0x32;
+const TOPICS_RESPONSE: u8 = 0x33;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -39,6 +43,21 @@ pub enum Request {
     CommitOffset(CommitOffsetRequest),
     FetchCommittedOffset(FetchCommittedOffsetRequest),
     GroupFetch(GroupFetchRequest),
+    CreateTopic(CreateTopicRequest),
+    ListTopics,
+    DescribeTopic(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTopicRequest {
+    pub topic: String,
+    pub partitions: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicMetadata {
+    pub topic: String,
+    pub partitions: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +358,7 @@ pub enum Response {
     JoinGroup(JoinGroupResponse),
     GroupAck,
     CommittedOffset(Option<u64>),
+    Topics(Vec<TopicMetadata>),
     Error(String),
 }
 
@@ -444,6 +464,16 @@ pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, Protocol
         FETCH_COMMITTED_OFFSET => decode_fetch_committed(frame)
             .map(|request| Some(Request::FetchCommittedOffset(request))),
         GROUP_FETCH => decode_group_fetch(frame).map(|request| Some(Request::GroupFetch(request))),
+        CREATE_TOPIC => {
+            decode_create_topic(frame).map(|request| Some(Request::CreateTopic(request)))
+        }
+        LIST_TOPICS if !frame.has_remaining() => Ok(Some(Request::ListTopics)),
+        DESCRIBE_TOPIC => {
+            let topic = decode_string(&mut frame)?;
+            ensure_empty(&frame)?;
+            validate_topic(&topic)?;
+            Ok(Some(Request::DescribeTopic(topic)))
+        }
         value => Err(ProtocolError::UnknownOpcode(value)),
     }
 }
@@ -459,6 +489,16 @@ pub fn encode_request(request: &Request, buffer: &mut BytesMut) -> Result<(), Pr
         Request::CommitOffset(request) => encode_commit_offset(request, buffer),
         Request::FetchCommittedOffset(request) => encode_fetch_committed(request, buffer),
         Request::GroupFetch(request) => encode_group_fetch(request, buffer),
+        Request::CreateTopic(request) => encode_create_topic(request, buffer),
+        Request::ListTopics => {
+            buffer.put_u32(1);
+            buffer.put_u8(LIST_TOPICS);
+            Ok(())
+        }
+        Request::DescribeTopic(topic) => {
+            validate_topic(topic)?;
+            encode_string_request(DESCRIBE_TOPIC, [topic], buffer).map(|_| ())
+        }
     }
 }
 
@@ -514,6 +554,17 @@ pub fn encode_response(response: &Response, buffer: &mut BytesMut) -> Result<(),
             buffer.put_u8(u8::from(offset.is_some()));
             buffer.put_u64(offset.unwrap_or_default());
             Ok(())
+        }
+        Response::Topics(topics) => {
+            let start = buffer.len();
+            buffer.put_u32(0);
+            buffer.put_u8(TOPICS_RESPONSE);
+            buffer.put_u32(u32::try_from(topics.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
+            for topic in topics {
+                encode_string(&topic.topic, buffer)?;
+                buffer.put_u32(topic.partitions);
+            }
+            set_frame_len(buffer, start)
         }
         Response::Error(message) => encode_string_response(ERROR_RESPONSE, message, buffer),
     }
@@ -608,6 +659,9 @@ pub fn decode_response(buffer: &mut BytesMut) -> Result<Option<Response>, Protoc
                 (found == 1).then_some(offset),
             )))
         }
+        TOPICS_RESPONSE => {
+            decode_topics_response(frame).map(|topics| Some(Response::Topics(topics)))
+        }
         ERROR_RESPONSE => {
             let message = decode_string(&mut frame)?;
             ensure_empty(&frame)?;
@@ -615,6 +669,22 @@ pub fn decode_response(buffer: &mut BytesMut) -> Result<Option<Response>, Protoc
         }
         value => Err(ProtocolError::UnknownOpcode(value)),
     }
+}
+
+fn decode_topics_response(mut frame: BytesMut) -> Result<Vec<TopicMetadata>, ProtocolError> {
+    ensure_remaining(&frame, 4)?;
+    let count = read_u32_len(&mut frame)?;
+    let mut topics = Vec::with_capacity(count);
+    for _ in 0..count {
+        let topic = decode_string(&mut frame)?;
+        ensure_remaining(&frame, 4)?;
+        topics.push(TopicMetadata {
+            topic,
+            partitions: frame.get_u32(),
+        });
+    }
+    ensure_empty(&frame)?;
+    Ok(topics)
 }
 
 fn decode_produce(mut frame: BytesMut) -> Result<ProduceRequest, ProtocolError> {
@@ -659,6 +729,18 @@ fn decode_produce(mut frame: BytesMut) -> Result<ProduceRequest, ProtocolError> 
     }
 
     ProduceRequest::new(topic, key, payload, ack_mode, producer)
+}
+
+fn decode_create_topic(mut frame: BytesMut) -> Result<CreateTopicRequest, ProtocolError> {
+    let topic = decode_string(&mut frame)?;
+    ensure_remaining(&frame, 4)?;
+    let partitions = frame.get_u32();
+    ensure_empty(&frame)?;
+    validate_topic(&topic)?;
+    if partitions == 0 {
+        return Err(ProtocolError::InvalidPartitionCount);
+    }
+    Ok(CreateTopicRequest { topic, partitions })
 }
 
 fn decode_produce_batch(mut frame: BytesMut) -> Result<ProduceBatchRequest, ProtocolError> {
@@ -764,6 +846,19 @@ fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(),
         buffer.put_u64(0);
     }
     Ok(())
+}
+
+fn encode_create_topic(
+    request: &CreateTopicRequest,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    validate_topic(&request.topic)?;
+    if request.partitions == 0 {
+        return Err(ProtocolError::InvalidPartitionCount);
+    }
+    let start = encode_string_request(CREATE_TOPIC, [&request.topic], buffer)?;
+    buffer.put_u32(request.partitions);
+    set_frame_len(buffer, start)
 }
 
 fn encode_produce_batch(
@@ -1197,6 +1292,8 @@ pub enum ProtocolError {
     InvalidCompression(u8),
     #[error("compressed batch is malformed or does not match its declared size")]
     InvalidCompressedBatch,
+    #[error("topic partition count must be greater than zero")]
+    InvalidPartitionCount,
 }
 
 #[cfg(test)]
@@ -1205,9 +1302,9 @@ mod tests {
     use bytes::{BufMut, Bytes, BytesMut};
 
     use super::{
-        AckMode, BatchRecord, Compression, FetchRequest, FetchResponse, FetchedRecord,
-        MAX_FRAME_SIZE, ProduceBatchRequest, ProduceRequest, ProtocolError, Request, Response,
-        decode_request, decode_response, encode_request, encode_response,
+        AckMode, BatchRecord, Compression, CreateTopicRequest, FetchRequest, FetchResponse,
+        FetchedRecord, MAX_FRAME_SIZE, ProduceBatchRequest, ProduceRequest, ProtocolError, Request,
+        Response, TopicMetadata, decode_request, decode_response, encode_request, encode_response,
     };
 
     fn produce_request() -> Request {
@@ -1279,6 +1376,35 @@ mod tests {
         encode_response(&response, &mut encoded).expect("batch ack should encode");
         assert_eq!(
             decode_response(&mut encoded).expect("batch ack should decode"),
+            Some(response)
+        );
+    }
+
+    #[test]
+    fn round_trips_topic_administration_frames() {
+        for request in [
+            Request::CreateTopic(CreateTopicRequest {
+                topic: "payments".to_owned(),
+                partitions: 6,
+            }),
+            Request::ListTopics,
+            Request::DescribeTopic("payments".to_owned()),
+        ] {
+            let mut encoded = BytesMut::new();
+            encode_request(&request, &mut encoded).expect("topic request should encode");
+            assert_eq!(
+                decode_request(&mut encoded).expect("topic request should decode"),
+                Some(request)
+            );
+        }
+        let response = Response::Topics(vec![TopicMetadata {
+            topic: "payments".to_owned(),
+            partitions: 6,
+        }]);
+        let mut encoded = BytesMut::new();
+        encode_response(&response, &mut encoded).expect("topics response should encode");
+        assert_eq!(
+            decode_response(&mut encoded).expect("topics response should decode"),
             Some(response)
         );
     }

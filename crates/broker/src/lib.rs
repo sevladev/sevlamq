@@ -13,7 +13,7 @@ use bytes::{Bytes, BytesMut};
 use sevlamq_common::{AdminConfig, BrokerConfig};
 use sevlamq_protocol::{
     AckMode, BatchRecord, FetchResponse, FetchedRecord, GroupFetchRequest, ProduceAck, Request,
-    Response, decode_request, encode_response,
+    Response, TopicMetadata, decode_request, encode_response,
 };
 use sevlamq_storage::{
     PartitionLog, ProducerIdentity as StorageProducerIdentity, Record, discover_partitions,
@@ -44,6 +44,8 @@ pub async fn run(config: &BrokerConfig, admin_config: &AdminConfig) -> Result<()
         config.max_segment_bytes,
         config.index_interval_bytes,
         config.default_partition_count,
+        config.retention_bytes,
+        config.retention_ms,
     )
     .await?;
     let listener = TcpListener::bind(address).await?;
@@ -54,6 +56,13 @@ pub async fn run(config: &BrokerConfig, admin_config: &AdminConfig) -> Result<()
         config.default_partition_count,
         Duration::from_millis(config.group_session_timeout_ms),
     )?;
+    for topic in storage
+        .list_topics()
+        .await
+        .map_err(|_| BrokerError::StorageUnavailable)?
+    {
+        groups.set_topic_partitions(&topic.topic, topic.partitions)?;
+    }
 
     let metrics = Arc::new(RuntimeMetrics::default());
     info!(%address, %admin_address, data_dir = %config.data_dir, "broker started");
@@ -212,6 +221,28 @@ async fn process_request(
         | Request::LeaveGroup(_)
         | Request::CommitOffset(_)
         | Request::FetchCommittedOffset(_)) => Ok(groups.execute(request).await),
+        Request::CreateTopic(request) => {
+            let metadata = match storage
+                .create_topic(request.topic, request.partitions)
+                .await
+            {
+                Ok(metadata) => metadata,
+                Err(ConnectionError::Storage(error)) => {
+                    return Ok(Response::Error(error.to_string()));
+                }
+                Err(error) => return Err(error),
+            };
+            groups
+                .set_topic_partitions(&metadata.topic, metadata.partitions)
+                .map_err(|_| ConnectionError::StorageUnavailable)?;
+            Ok(Response::Topics(vec![metadata]))
+        }
+        Request::ListTopics => storage.list_topics().await.map(Response::Topics),
+        Request::DescribeTopic(topic) => match storage.describe_topic(topic).await {
+            Ok(metadata) => Ok(Response::Topics(vec![metadata])),
+            Err(ConnectionError::Storage(error)) => Ok(Response::Error(error.to_string())),
+            Err(error) => Err(error),
+        },
     }
 }
 
@@ -409,11 +440,17 @@ fn render_partition_metrics(output: &mut String, partitions: &[PartitionSnapshot
             "sevlamq_partition_high_watermark{{{labels}}} {}",
             snapshot.high_watermark
         );
-        let _ = writeln!(output, "sevlamq_partition_low_watermark{{{labels}}} 0");
+        let _ = writeln!(
+            output,
+            "sevlamq_partition_low_watermark{{{labels}}} {}",
+            snapshot.low_watermark
+        );
         let _ = writeln!(
             output,
             "sevlamq_partition_records{{{labels}}} {}",
-            snapshot.high_watermark
+            snapshot
+                .high_watermark
+                .saturating_sub(snapshot.low_watermark)
         );
         let _ = writeln!(
             output,
@@ -489,7 +526,9 @@ fn render_group_metrics(
                 .iter()
                 .find_map(|(id, offset)| (*id == partition.partition).then_some(*offset))
                 .unwrap_or_default();
-            let lag = partition.high_watermark.saturating_sub(committed);
+            let lag = partition
+                .high_watermark
+                .saturating_sub(committed.max(partition.low_watermark));
             total_lag = total_lag.saturating_add(lag);
             let partition_labels = format!("{labels},partition=\"{}\"", partition.partition);
             let _ = writeln!(
@@ -550,6 +589,13 @@ impl GroupHandle {
         .await
         .map_err(|_| ConnectionError::StorageUnavailable)?
         .map_err(|_| ConnectionError::StorageUnavailable)
+    }
+
+    fn set_topic_partitions(&self, topic: &str, partitions: u32) -> Result<(), groups::GroupError> {
+        self.coordinator
+            .lock()
+            .map_err(|_| groups::GroupError::CoordinatorPoisoned)?
+            .set_topic_partitions(topic, partitions)
     }
 }
 
@@ -632,7 +678,12 @@ fn execute_group_request(
                 request.partition,
             )
             .map(|()| Response::GroupAck),
-        Request::Produce(_) | Request::ProduceBatch(_) | Request::Fetch(_) => {
+        Request::Produce(_)
+        | Request::ProduceBatch(_)
+        | Request::Fetch(_)
+        | Request::CreateTopic(_)
+        | Request::ListTopics
+        | Request::DescribeTopic(_) => {
             unreachable!("group requests are filtered")
         }
     }
@@ -649,6 +700,7 @@ struct PartitionSnapshot {
     topic: String,
     partition: u32,
     high_watermark: u64,
+    low_watermark: u64,
     log_size_bytes: u64,
     segments: usize,
 }
@@ -656,6 +708,47 @@ struct PartitionSnapshot {
 impl StorageHandle {
     fn queue_depth(&self) -> usize {
         self.sender.max_capacity() - self.sender.capacity()
+    }
+
+    async fn create_topic(
+        &self,
+        topic: String,
+        partitions: u32,
+    ) -> Result<TopicMetadata, ConnectionError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::CreateTopic {
+                topic,
+                partitions,
+                reply,
+            })
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        response
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?
+            .map_err(ConnectionError::Storage)
+    }
+
+    async fn list_topics(&self) -> Result<Vec<TopicMetadata>, ConnectionError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::ListTopics { reply })
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        response
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)
+    }
+
+    async fn describe_topic(&self, topic: String) -> Result<TopicMetadata, ConnectionError> {
+        let topics = self.list_topics().await?;
+        topics
+            .into_iter()
+            .find(|metadata| metadata.topic == topic)
+            .ok_or(ConnectionError::Storage(
+                sevlamq_storage::StorageError::UnknownTopic,
+            ))
     }
 
     async fn snapshot(&self) -> Result<Vec<PartitionSnapshot>, ConnectionError> {
@@ -771,6 +864,14 @@ impl StorageHandle {
 }
 
 enum StorageCommand {
+    CreateTopic {
+        topic: String,
+        partitions: u32,
+        reply: oneshot::Sender<Result<TopicMetadata, sevlamq_storage::StorageError>>,
+    },
+    ListTopics {
+        reply: oneshot::Sender<Vec<TopicMetadata>>,
+    },
     Append {
         topic: String,
         key: Bytes,
@@ -795,6 +896,7 @@ enum StorageCommand {
     Snapshot {
         reply: oneshot::Sender<Vec<PartitionSnapshot>>,
     },
+    ApplyRetention,
 }
 
 struct StorageSettings {
@@ -802,6 +904,8 @@ struct StorageSettings {
     max_segment_bytes: u64,
     index_interval_bytes: u64,
     default_partition_count: u32,
+    retention_bytes: Option<u64>,
+    retention_age: Option<Duration>,
 }
 
 struct AppendInput {
@@ -820,6 +924,8 @@ async fn start_storage_worker(
     max_segment_bytes: u64,
     index_interval_bytes: u64,
     default_partition_count: u32,
+    retention_bytes: u64,
+    retention_ms: u64,
 ) -> Result<
     (
         StorageHandle,
@@ -835,78 +941,29 @@ async fn start_storage_worker(
         max_segment_bytes,
         index_interval_bytes,
         default_partition_count,
+        retention_bytes: (retention_bytes > 0).then_some(retention_bytes),
+        retention_age: (retention_ms > 0).then(|| Duration::from_millis(retention_ms)),
     };
-    let (settings, mut logs) =
+    let (settings, mut logs, mut topics) =
         tokio::task::spawn_blocking(move || recover_storage(settings)).await??;
     let (sender, mut receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
-    let new_records = Arc::new(Notify::new());
-    let worker = tokio::task::spawn_blocking(move || {
-        let mut round_robin = HashMap::<String, u32>::new();
-        while let Some(command) = receiver.blocking_recv() {
-            match command {
-                StorageCommand::Append {
-                    topic,
-                    key,
-                    value,
-                    ack_mode,
-                    producer,
-                    reply,
-                } => {
-                    let input = AppendInput {
-                        topic,
-                        key,
-                        value,
-                        ack_mode,
-                        producer,
-                    };
-                    let result = append_record(&settings, &mut logs, &mut round_robin, input);
-                    let _ = reply.send(result);
-                }
-                StorageCommand::AppendBatch {
-                    topic,
-                    records,
-                    ack_mode,
-                    reply,
-                } => {
-                    let result = append_batch_records(
-                        &settings,
-                        &mut logs,
-                        &mut round_robin,
-                        &topic,
-                        records,
-                        ack_mode,
-                    );
-                    let _ = reply.send(result);
-                }
-                StorageCommand::Read {
-                    topic,
-                    partition,
-                    offset,
-                    max_bytes,
-                    reply,
-                } => {
-                    let result =
-                        read_records(&settings, &mut logs, &topic, partition, offset, max_bytes);
-                    let _ = reply.send(result);
-                }
-                StorageCommand::Snapshot { reply } => {
-                    let mut snapshots: Vec<_> = logs
-                        .iter()
-                        .map(|((topic, partition), log)| PartitionSnapshot {
-                            topic: topic.clone(),
-                            partition: *partition,
-                            high_watermark: log.next_offset(),
-                            log_size_bytes: log.log_size_bytes(),
-                            segments: log.segments().len(),
-                        })
-                        .collect();
-                    snapshots.sort_unstable_by(|left, right| {
-                        (&left.topic, left.partition).cmp(&(&right.topic, right.partition))
-                    });
-                    let _ = reply.send(snapshots);
-                }
+    let retention_sender = sender.downgrade();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(sender) = retention_sender.upgrade() else {
+                break;
+            };
+            if sender.send(StorageCommand::ApplyRetention).await.is_err() {
+                break;
             }
         }
+    });
+    let new_records = Arc::new(Notify::new());
+    let worker = tokio::task::spawn_blocking(move || {
+        run_storage_worker(&settings, &mut logs, &mut topics, &mut receiver);
         Ok(())
     });
     Ok((
@@ -918,22 +975,122 @@ async fn start_storage_worker(
     ))
 }
 
+fn run_storage_worker(
+    settings: &StorageSettings,
+    logs: &mut PartitionLogs,
+    topics: &mut HashMap<String, u32>,
+    receiver: &mut mpsc::Receiver<StorageCommand>,
+) {
+    let mut round_robin = HashMap::<String, u32>::new();
+    while let Some(command) = receiver.blocking_recv() {
+        match command {
+            StorageCommand::CreateTopic {
+                topic,
+                partitions,
+                reply,
+            } => {
+                let result = create_topic(settings, logs, topics, &topic, partitions);
+                let _ = reply.send(result);
+            }
+            StorageCommand::ListTopics { reply } => {
+                let mut metadata: Vec<_> = topics
+                    .iter()
+                    .map(|(topic, partitions)| TopicMetadata {
+                        topic: topic.clone(),
+                        partitions: *partitions,
+                    })
+                    .collect();
+                metadata.sort_unstable_by(|left, right| left.topic.cmp(&right.topic));
+                let _ = reply.send(metadata);
+            }
+            StorageCommand::Append {
+                topic,
+                key,
+                value,
+                ack_mode,
+                producer,
+                reply,
+            } => {
+                let input = AppendInput {
+                    topic,
+                    key,
+                    value,
+                    ack_mode,
+                    producer,
+                };
+                let result = append_record(settings, logs, topics, &mut round_robin, input);
+                let _ = reply.send(result);
+            }
+            StorageCommand::AppendBatch {
+                topic,
+                records,
+                ack_mode,
+                reply,
+            } => {
+                let result = append_batch_records(
+                    settings,
+                    logs,
+                    topics,
+                    &mut round_robin,
+                    &topic,
+                    records,
+                    ack_mode,
+                );
+                let _ = reply.send(result);
+            }
+            StorageCommand::Read {
+                topic,
+                partition,
+                offset,
+                max_bytes,
+                reply,
+            } => {
+                let result =
+                    read_records(settings, logs, topics, &topic, partition, offset, max_bytes);
+                let _ = reply.send(result);
+            }
+            StorageCommand::Snapshot { reply } => {
+                let mut snapshots: Vec<_> = logs
+                    .iter()
+                    .map(|((topic, partition), log)| PartitionSnapshot {
+                        topic: topic.clone(),
+                        partition: *partition,
+                        high_watermark: log.next_offset(),
+                        low_watermark: log.low_watermark(),
+                        log_size_bytes: log.log_size_bytes(),
+                        segments: log.segments().len(),
+                    })
+                    .collect();
+                snapshots.sort_unstable_by(|left, right| {
+                    (&left.topic, left.partition).cmp(&(&right.topic, right.partition))
+                });
+                let _ = reply.send(snapshots);
+            }
+            StorageCommand::ApplyRetention => {
+                for ((topic, partition), log) in logs.iter_mut() {
+                    match log.apply_retention(settings.retention_bytes, settings.retention_age) {
+                        Ok(removed) if removed > 0 => {
+                            info!(topic, partition, removed, "expired log segments removed");
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!(topic, partition, %error, "retention failed"),
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn recover_storage(
     settings: StorageSettings,
-) -> Result<(StorageSettings, PartitionLogs), BrokerError> {
+) -> Result<(StorageSettings, PartitionLogs, HashMap<String, u32>), BrokerError> {
     let identities = discover_partitions(&settings.data_dir)?;
     let mut logs = HashMap::with_capacity(identities.len());
+    let mut topics = HashMap::<String, u32>::new();
 
     for identity in identities {
         let topic = identity.topic().to_owned();
         let partition = identity.partition();
-        if partition >= settings.default_partition_count {
-            return Err(BrokerError::PartitionOutsideConfiguredRange {
-                topic,
-                partition,
-                partition_count: settings.default_partition_count,
-            });
-        }
         let log = PartitionLog::open(
             &settings.data_dir,
             &topic,
@@ -949,15 +1106,23 @@ fn recover_storage(
             "partition recovered"
         );
         logs.insert((topic, partition), log);
+        topics
+            .entry(identity.topic().to_owned())
+            .and_modify(|count| *count = (*count).max(partition + 1))
+            .or_insert(partition + 1);
     }
 
     info!(partitions = logs.len(), "storage recovery completed");
-    Ok((settings, logs))
+    for (topic, partitions) in &topics {
+        persist_topic_metadata(&settings.data_dir, topic, *partitions)?;
+    }
+    Ok((settings, logs, topics))
 }
 
 fn append_record(
     settings: &StorageSettings,
     logs: &mut PartitionLogs,
+    topics: &mut HashMap<String, u32>,
     round_robin: &mut HashMap<String, u32>,
     input: AppendInput,
 ) -> Result<ProduceAck, sevlamq_storage::StorageError> {
@@ -968,18 +1133,13 @@ fn append_record(
         ack_mode,
         producer,
     } = input;
-    ensure_topic_partitions(settings, logs, &topic)?;
+    let partition_count = ensure_topic(settings, logs, topics, &topic)?;
     let routing_key = if key.is_empty() {
         producer.as_ref().map(|producer| producer.id().as_bytes())
     } else {
         Some(key.as_ref())
     };
-    let partition = select_partition(
-        settings.default_partition_count,
-        round_robin,
-        &topic,
-        routing_key,
-    );
+    let partition = select_partition(partition_count, round_robin, &topic, routing_key);
     let partition_key = (topic, partition);
     let log = logs
         .get_mut(&partition_key)
@@ -1006,6 +1166,7 @@ fn append_record(
 fn append_batch_records(
     settings: &StorageSettings,
     logs: &mut PartitionLogs,
+    topics: &mut HashMap<String, u32>,
     round_robin: &mut HashMap<String, u32>,
     topic: &str,
     records: Vec<BatchRecord>,
@@ -1016,6 +1177,7 @@ fn append_batch_records(
         acks.push(append_record(
             settings,
             logs,
+            topics,
             round_robin,
             AppendInput {
                 topic: topic.to_owned(),
@@ -1039,12 +1201,39 @@ fn append_batch_records(
     Ok(acks)
 }
 
-fn ensure_topic_partitions(
+fn ensure_topic(
     settings: &StorageSettings,
     logs: &mut PartitionLogs,
+    topics: &mut HashMap<String, u32>,
     topic: &str,
-) -> Result<(), sevlamq_storage::StorageError> {
-    for partition in 0..settings.default_partition_count {
+) -> Result<u32, sevlamq_storage::StorageError> {
+    if let Some(partitions) = topics.get(topic) {
+        return Ok(*partitions);
+    }
+    create_topic(
+        settings,
+        logs,
+        topics,
+        topic,
+        settings.default_partition_count,
+    )
+    .map(|metadata| metadata.partitions)
+}
+
+fn create_topic(
+    settings: &StorageSettings,
+    logs: &mut PartitionLogs,
+    topics: &mut HashMap<String, u32>,
+    topic: &str,
+    partitions: u32,
+) -> Result<TopicMetadata, sevlamq_storage::StorageError> {
+    if partitions == 0 {
+        return Err(sevlamq_storage::StorageError::InvalidTopic);
+    }
+    if topics.contains_key(topic) {
+        return Err(sevlamq_storage::StorageError::TopicAlreadyExists);
+    }
+    for partition in 0..partitions {
         let partition_key = (topic.to_owned(), partition);
         if let std::collections::hash_map::Entry::Vacant(entry) = logs.entry(partition_key) {
             entry.insert(PartitionLog::open(
@@ -1056,6 +1245,28 @@ fn ensure_topic_partitions(
             )?);
         }
     }
+    persist_topic_metadata(&settings.data_dir, topic, partitions)?;
+    topics.insert(topic.to_owned(), partitions);
+    Ok(TopicMetadata {
+        topic: topic.to_owned(),
+        partitions,
+    })
+}
+
+fn persist_topic_metadata(
+    data_dir: &Path,
+    topic: &str,
+    partitions: u32,
+) -> Result<(), sevlamq_storage::StorageError> {
+    use std::io::Write as _;
+    let topic_dir = data_dir.join(topic);
+    let path = topic_dir.join("topic.meta");
+    let temporary = topic_dir.join("topic.meta.tmp");
+    let mut file = std::fs::File::create(&temporary)?;
+    writeln!(file, "partitions={partitions}")?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    std::fs::File::open(topic_dir)?.sync_all()?;
     Ok(())
 }
 
@@ -1078,14 +1289,16 @@ fn select_partition(
 fn read_records(
     settings: &StorageSettings,
     logs: &mut PartitionLogs,
+    topics: &mut HashMap<String, u32>,
     topic: &str,
     partition: u32,
     offset: u64,
     max_bytes: u32,
 ) -> Result<Vec<FetchedRecord>, sevlamq_storage::StorageError> {
+    let partition_count = ensure_topic(settings, logs, topics, topic)?;
     let partition_key = (topic.to_owned(), partition);
     if !logs.contains_key(&partition_key) {
-        if partition >= settings.default_partition_count {
+        if partition >= partition_count {
             return Err(sevlamq_storage::StorageError::UnknownPartition(partition));
         }
         logs.insert(
@@ -1144,6 +1357,8 @@ pub enum BrokerError {
     Group(#[from] groups::GroupError),
     #[error("default partition count must be greater than zero")]
     InvalidPartitionCount,
+    #[error("storage worker is unavailable during broker startup")]
+    StorageUnavailable,
     #[error(
         "topic {topic} has partition {partition}, outside configured partition count {partition_count}"
     )]
@@ -1193,6 +1408,7 @@ mod tests {
             topic: "payments".to_owned(),
             partition: 0,
             high_watermark: 13,
+            low_watermark: 0,
             log_size_bytes: 512,
             segments: 2,
         }];
@@ -1252,7 +1468,7 @@ mod tests {
         fs::write(&index_path, b"broken index").expect("index should be corrupted");
 
         let (storage, storage_worker) =
-            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3)
+            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3, 0, 0)
                 .await
                 .expect("storage recovery should complete");
 
@@ -1273,7 +1489,7 @@ mod tests {
     async fn wakes_long_poll_when_a_record_is_appended() {
         let data_dir = tempdir().expect("temporary directory should be created");
         let (storage, storage_worker) =
-            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 1)
+            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 1, 0, 0)
                 .await
                 .expect("storage worker should start");
         let waiting_storage = storage.clone();
@@ -1313,7 +1529,7 @@ mod tests {
     async fn appends_a_durable_batch_and_returns_each_offset() {
         let data_dir = tempdir().expect("temporary directory should be created");
         let (storage, storage_worker) =
-            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 1)
+            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 1, 0, 0)
                 .await
                 .expect("storage worker should start");
 
@@ -1349,7 +1565,7 @@ mod tests {
     async fn fetches_an_empty_partition_before_the_first_produce() {
         let data_dir = tempdir().expect("temporary directory should be created");
         let (storage, storage_worker) =
-            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3)
+            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3, 0, 0)
                 .await
                 .expect("storage worker should start");
 
@@ -1378,7 +1594,7 @@ mod tests {
                 .expect("listener should have an address");
             let data_dir = tempdir().expect("temporary directory should be created");
             let (storage, storage_worker) =
-                start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3)
+                start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3, 0, 0)
                     .await
                     .expect("storage worker should start");
             let connection_storage = storage.clone();
