@@ -147,6 +147,13 @@ pub struct ProduceRequest {
     key: Bytes,
     payload: Bytes,
     ack_mode: AckMode,
+    producer: Option<ProducerIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerIdentity {
+    pub id: String,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +185,7 @@ impl ProduceRequest {
         key: Bytes,
         payload: Bytes,
         ack_mode: AckMode,
+        producer: Option<ProducerIdentity>,
     ) -> Result<Self, ProtocolError> {
         validate_topic(&topic)?;
         validate_size(key.len(), MAX_KEY_SIZE, ProtocolError::KeyTooLarge)?;
@@ -186,11 +194,15 @@ impl ProduceRequest {
             MAX_MESSAGE_SIZE,
             ProtocolError::MessageTooLarge,
         )?;
+        if let Some(producer) = &producer {
+            validate_identifier(&producer.id)?;
+        }
         Ok(Self {
             topic,
             key,
             payload,
             ack_mode,
+            producer,
         })
     }
 
@@ -212,6 +224,11 @@ impl ProduceRequest {
     #[must_use]
     pub const fn ack_mode(&self) -> AckMode {
         self.ack_mode
+    }
+
+    #[must_use]
+    pub const fn producer(&self) -> Option<&ProducerIdentity> {
+        self.producer.as_ref()
     }
 }
 
@@ -484,12 +501,26 @@ fn decode_produce(mut frame: BytesMut) -> Result<ProduceRequest, ProtocolError> 
     let payload = read_bytes(&mut frame, payload_len)?;
     ensure_remaining(&frame, 1)?;
     let ack_mode = AckMode::from_code(frame.get_u8())?;
+    let producer_len = read_u16_len(&mut frame)?;
+    let producer = if producer_len == 0 {
+        ensure_remaining(&frame, size_of::<u64>())?;
+        let _ = frame.get_u64();
+        None
+    } else {
+        let id = read_bytes(&mut frame, producer_len)?;
+        let id = String::from_utf8(id.to_vec()).map_err(|_| ProtocolError::InvalidProducerId)?;
+        ensure_remaining(&frame, size_of::<u64>())?;
+        Some(ProducerIdentity {
+            id,
+            sequence: frame.get_u64(),
+        })
+    };
 
     if frame.has_remaining() {
         return Err(ProtocolError::InvalidFrame);
     }
 
-    ProduceRequest::new(topic, key, payload, ack_mode)
+    ProduceRequest::new(topic, key, payload, ack_mode, producer)
 }
 
 fn decode_fetch(mut frame: BytesMut) -> Result<FetchRequest, ProtocolError> {
@@ -512,8 +543,21 @@ fn decode_fetch(mut frame: BytesMut) -> Result<FetchRequest, ProtocolError> {
 }
 
 fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
-    let frame_len =
-        1 + 2 + request.topic.len() + 2 + request.key.len() + 4 + request.payload.len() + 1;
+    let producer_len = request
+        .producer
+        .as_ref()
+        .map_or(0, |producer| producer.id.len());
+    let frame_len = 1
+        + 2
+        + request.topic.len()
+        + 2
+        + request.key.len()
+        + 4
+        + request.payload.len()
+        + 1
+        + 2
+        + producer_len
+        + 8;
     buffer.put_u32(u32::try_from(frame_len).map_err(|_| ProtocolError::FrameTooLarge)?);
     buffer.put_u8(PRODUCE);
     buffer.put_u16(u16::try_from(request.topic.len()).map_err(|_| ProtocolError::TopicTooLarge)?);
@@ -524,6 +568,13 @@ fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(),
         .put_u32(u32::try_from(request.payload.len()).map_err(|_| ProtocolError::MessageTooLarge)?);
     buffer.extend_from_slice(&request.payload);
     buffer.put_u8(request.ack_mode.code());
+    buffer.put_u16(u16::try_from(producer_len).map_err(|_| ProtocolError::InvalidProducerId)?);
+    if let Some(producer) = &request.producer {
+        buffer.extend_from_slice(producer.id.as_bytes());
+        buffer.put_u64(producer.sequence);
+    } else {
+        buffer.put_u64(0);
+    }
     Ok(())
 }
 
@@ -844,6 +895,18 @@ fn validate_topic(topic: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+fn validate_identifier(value: &str) -> Result<(), ProtocolError> {
+    if value.is_empty()
+        || value.len() > MAX_TOPIC_NAME
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(ProtocolError::InvalidProducerId);
+    }
+    Ok(())
+}
+
 fn read_u16_len(buffer: &mut BytesMut) -> Result<usize, ProtocolError> {
     ensure_remaining(buffer, size_of::<u16>())?;
     Ok(usize::from(buffer.get_u16()))
@@ -899,6 +962,8 @@ pub enum ProtocolError {
     FetchWaitTooLong,
     #[error("produce ack mode {0} is not supported")]
     InvalidAckMode(u8),
+    #[error("producer id is invalid")]
+    InvalidProducerId,
 }
 
 #[cfg(test)]
@@ -918,6 +983,10 @@ mod tests {
                 Bytes::from_static(b"customer-123"),
                 Bytes::from_static(br#"{"amount":150}"#),
                 super::AckMode::Leader,
+                Some(super::ProducerIdentity {
+                    id: "producer-a".to_owned(),
+                    sequence: 0,
+                }),
             )
             .expect("request should be valid"),
         )

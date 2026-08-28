@@ -14,6 +14,9 @@ pub(super) struct Options {
     pub wait_ms: u32,
     pub heartbeat_ms: u64,
     pub max_bytes: u32,
+    pub handler: Option<String>,
+    pub handler_timeout_ms: u64,
+    pub retry_delays_ms: Vec<u64>,
 }
 
 pub(super) async fn execute(broker: SocketAddr, options: Options) -> Result<(), CliError> {
@@ -96,28 +99,94 @@ async fn consume_generation(
                 Err(ClientError::Server(_)) => return Ok(GenerationOutcome::Rejoin),
                 Err(error) => return Err(error.into()),
             };
-            let Some(last) = response.records().last() else {
-                continue;
-            };
-            let next_offset = last.offset.checked_add(1).ok_or(CliError::OffsetOverflow)?;
-            if matches!(options.delivery, DeliveryMode::AtMostOnce)
-                && commit_requires_rejoin(
-                    commit(client, options, generation, *partition, next_offset).await,
-                )?
-            {
-                return Ok(GenerationOutcome::Rejoin);
+            for record in response.records() {
+                let next_offset = record
+                    .offset
+                    .checked_add(1)
+                    .ok_or(CliError::OffsetOverflow)?;
+                if process_record(client, options, generation, *partition, record, next_offset)
+                    .await?
+                {
+                    return Ok(GenerationOutcome::Rejoin);
+                }
+                offsets.insert(*partition, next_offset);
             }
-            super::fetch::print_partition_records(*partition, &response);
-            if matches!(options.delivery, DeliveryMode::AtLeastOnce)
-                && commit_requires_rejoin(
-                    commit(client, options, generation, *partition, next_offset).await,
-                )?
-            {
-                return Ok(GenerationOutcome::Rejoin);
-            }
-            offsets.insert(*partition, next_offset);
         }
     }
+}
+
+async fn process_record(
+    client: &mut Client,
+    options: &Options,
+    generation: u64,
+    partition: u32,
+    record: &sevlamq_protocol::FetchedRecord,
+    next_offset: u64,
+) -> Result<bool, CliError> {
+    if matches!(options.delivery, DeliveryMode::AtMostOnce)
+        && commit_requires_rejoin(
+            commit(client, options, generation, partition, next_offset).await,
+        )?
+    {
+        return Ok(true);
+    }
+
+    let context = super::retry::context(&options.topic, partition, record)?;
+    super::retry::wait_until_available(&context).await?;
+    match super::retry::run_handler(
+        options.handler.as_deref(),
+        options.handler_timeout_ms,
+        &context.payload,
+    )
+    .await?
+    {
+        Ok(()) => print_processed(partition, record, &context),
+        Err(error) => {
+            let destination = super::retry::publish_failure(
+                client,
+                &options.group,
+                &context,
+                &error,
+                &options.retry_delays_ms,
+            )
+            .await?;
+            eprintln!(
+                "partition={} offset={} attempt={} failed={} routed_to={}",
+                partition, record.offset, context.attempt, error, destination
+            );
+        }
+    }
+
+    if matches!(options.delivery, DeliveryMode::AtLeastOnce)
+        && commit_requires_rejoin(
+            commit(client, options, generation, partition, next_offset).await,
+        )?
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn print_processed(
+    partition: u32,
+    record: &sevlamq_protocol::FetchedRecord,
+    context: &super::retry::MessageContext,
+) {
+    println!(
+        "partition={} offset={} original_topic={} original_partition={} original_offset={} attempt={} key={} value={}",
+        partition,
+        record.offset,
+        context.original_topic,
+        context.original_partition,
+        context.original_offset,
+        context.attempt,
+        if context.key.is_empty() {
+            "-".into()
+        } else {
+            String::from_utf8_lossy(&context.key)
+        },
+        String::from_utf8_lossy(&context.payload)
+    );
 }
 
 async fn load_offsets(

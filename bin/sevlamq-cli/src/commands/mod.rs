@@ -9,6 +9,7 @@ mod consume;
 mod fetch;
 mod group;
 mod produce;
+mod retry;
 
 pub async fn execute(cli: Cli) -> Result<(), CliError> {
     match cli.command {
@@ -20,6 +21,9 @@ pub async fn execute(cli: Cli) -> Result<(), CliError> {
             wait_ms,
             heartbeat_ms,
             max_bytes,
+            handler,
+            handler_timeout_ms,
+            retry_delays_ms,
         } => {
             consume::execute(
                 cli.broker,
@@ -31,6 +35,9 @@ pub async fn execute(cli: Cli) -> Result<(), CliError> {
                     wait_ms,
                     heartbeat_ms,
                     max_bytes,
+                    handler,
+                    handler_timeout_ms,
+                    retry_delays_ms,
                 },
             )
             .await
@@ -47,7 +54,22 @@ async fn execute_single(broker: std::net::SocketAddr, command: Command) -> Resul
             message,
             key,
             acks,
-        } => produce::execute(&mut client, topic, message, key, acks).await,
+            producer_id,
+            sequence,
+        } => {
+            produce::execute(
+                &mut client,
+                produce::Options {
+                    topic,
+                    message,
+                    key,
+                    acks,
+                    producer_id,
+                    sequence,
+                },
+            )
+            .await
+        }
         Command::Fetch {
             topic,
             partition,

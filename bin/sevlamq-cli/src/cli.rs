@@ -22,6 +22,10 @@ pub enum Command {
         key: Option<String>,
         #[arg(long, value_enum, default_value_t = ProduceAcks::Leader)]
         acks: ProduceAcks,
+        #[arg(long, requires = "sequence")]
+        producer_id: Option<String>,
+        #[arg(long, requires = "producer_id")]
+        sequence: Option<u64>,
     },
     /// Reads persisted records starting at an offset.
     Fetch {
@@ -59,6 +63,12 @@ pub enum Command {
         heartbeat_ms: u64,
         #[arg(long, default_value_t = 1024 * 1024)]
         max_bytes: u32,
+        #[arg(long)]
+        handler: Option<String>,
+        #[arg(long, default_value_t = 30_000)]
+        handler_timeout_ms: u64,
+        #[arg(long, value_delimiter = ',', default_value = "1000,5000,30000")]
+        retry_delays_ms: Vec<u64>,
     },
 }
 
@@ -215,6 +225,7 @@ mod tests {
                 delivery: super::DeliveryMode::AtLeastOnce,
                 wait_ms: 1_000,
                 heartbeat_ms: 3_000,
+                handler: None,
                 ..
             }
         ));

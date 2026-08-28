@@ -33,20 +33,3 @@ pub(super) fn print_records(response: &FetchResponse) {
         );
     }
 }
-
-pub(super) fn print_partition_records(partition: u32, response: &FetchResponse) {
-    for record in response.records() {
-        let key = record
-            .key
-            .as_ref()
-            .map_or_else(|| "-".into(), |key| String::from_utf8_lossy(key));
-        println!(
-            "partition={} offset={} timestamp_ms={} key={} value={}",
-            partition,
-            record.offset,
-            record.timestamp_ms,
-            key,
-            String::from_utf8_lossy(&record.value)
-        );
-    }
-}

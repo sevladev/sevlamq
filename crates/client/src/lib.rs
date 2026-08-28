@@ -4,7 +4,7 @@ use bytes::{Bytes, BytesMut};
 use sevlamq_protocol::{
     AckMode, CommitOffsetRequest, FetchCommittedOffsetRequest, FetchRequest, FetchResponse,
     GroupFetchRequest, GroupGenerationRequest, GroupMemberRequest, JoinGroupResponse, ProduceAck,
-    ProduceRequest, Request, Response, decode_response, encode_request,
+    ProduceRequest, ProducerIdentity, Request, Response, decode_response, encode_request,
 };
 use thiserror::Error;
 use tokio::{
@@ -34,8 +34,11 @@ impl Client {
         key: Bytes,
         payload: Bytes,
         ack_mode: AckMode,
+        producer: Option<ProducerIdentity>,
     ) -> Result<ProduceAck, ClientError> {
-        let request = Request::Produce(ProduceRequest::new(topic, key, payload, ack_mode)?);
+        let request = Request::Produce(ProduceRequest::new(
+            topic, key, payload, ack_mode, producer,
+        )?);
         match self.request(request).await? {
             Response::ProduceAck(ack) => Ok(ack),
             _ => Err(ClientError::UnexpectedResponse),

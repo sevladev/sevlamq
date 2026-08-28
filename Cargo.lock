@@ -387,6 +387,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "crc32fast",
  "sevlamq-client",
  "sevlamq-protocol",
  "thiserror",

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -10,12 +11,15 @@ use thiserror::Error;
 
 pub const MAX_RECORD_SIZE: usize = 16 * 1024 * 1024;
 
-const RECORD_VERSION: u8 = 1;
+const RECORD_VERSION_V1: u8 = 1;
+const RECORD_VERSION: u8 = 2;
 const LENGTH_SIZE: usize = size_of::<u32>();
 const CRC_SIZE: usize = size_of::<u32>();
 const BODY_FIXED_SIZE: usize =
+    size_of::<u8>() + size_of::<u64>() * 3 + size_of::<i32>() * 2 + size_of::<u32>();
+const V1_BODY_FIXED_SIZE: usize =
     size_of::<u8>() + size_of::<u64>() * 2 + size_of::<i32>() + size_of::<u32>();
-const MIN_RECORD_SIZE: usize = CRC_SIZE + BODY_FIXED_SIZE;
+const MIN_RECORD_SIZE: usize = CRC_SIZE + V1_BODY_FIXED_SIZE;
 const INDEX_ENTRY_SIZE: usize = size_of::<u64>() * 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +27,25 @@ pub struct Record {
     key: Option<Bytes>,
     value: Bytes,
     timestamp_ms: u64,
+    producer: Option<ProducerIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerIdentity {
+    id: String,
+    sequence: u64,
+}
+
+impl ProducerIdentity {
+    #[must_use]
+    pub const fn new(id: String, sequence: u64) -> Self {
+        Self { id, sequence }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 impl Record {
@@ -32,7 +55,14 @@ impl Record {
             key,
             value,
             timestamp_ms,
+            producer: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_producer(mut self, producer: ProducerIdentity) -> Self {
+        self.producer = Some(producer);
+        self
     }
 }
 
@@ -42,6 +72,7 @@ pub struct StoredRecord {
     timestamp_ms: u64,
     key: Option<Bytes>,
     value: Bytes,
+    producer: Option<ProducerIdentity>,
 }
 
 impl StoredRecord {
@@ -74,6 +105,7 @@ pub struct PartitionLog {
     segments: Vec<SegmentMetadata>,
     active_file: File,
     active_index_file: File,
+    producer_state: HashMap<String, (u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +189,7 @@ impl PartitionLog {
         }
 
         let mut next_offset = 0_u64;
+        let mut producer_state = HashMap::new();
         let last_index = segments.len() - 1;
         for (index, segment) in segments.iter_mut().enumerate() {
             if segment.base_offset != next_offset {
@@ -166,8 +199,12 @@ impl PartitionLog {
                 });
             }
             let is_active = index == last_index;
-            let (recovered_offset, valid_len, recovered_index) =
-                recover_segment(&segment.path, next_offset, index_interval_bytes)?;
+            let (recovered_offset, valid_len, recovered_index) = recover_segment(
+                &segment.path,
+                next_offset,
+                index_interval_bytes,
+                &mut producer_state,
+            )?;
             if valid_len < segment.len {
                 if !is_active {
                     return Err(StorageError::IncompleteClosedSegment(segment.base_offset));
@@ -201,10 +238,32 @@ impl PartitionLog {
             segments,
             active_file,
             active_index_file,
+            producer_state,
         })
     }
 
     pub fn append(&mut self, record: &Record) -> Result<u64, StorageError> {
+        if let Some(producer) = &record.producer {
+            validate_producer_id(&producer.id)?;
+            match self.producer_state.get(&producer.id) {
+                Some(&(sequence, offset)) if sequence == producer.sequence => return Ok(offset),
+                Some(&(sequence, _)) if producer.sequence != sequence.saturating_add(1) => {
+                    return Err(StorageError::UnexpectedProducerSequence {
+                        producer_id: producer.id.clone(),
+                        expected: sequence.saturating_add(1),
+                        actual: producer.sequence,
+                    });
+                }
+                None if producer.sequence != 0 => {
+                    return Err(StorageError::UnexpectedProducerSequence {
+                        producer_id: producer.id.clone(),
+                        expected: 0,
+                        actual: producer.sequence,
+                    });
+                }
+                Some(_) | None => {}
+            }
+        }
         let offset = self.next_offset;
         let encoded = encode_record(record, offset)?;
         let encoded_len = u64::try_from(encoded.len()).map_err(|_| StorageError::RecordTooLarge)?;
@@ -244,6 +303,10 @@ impl PartitionLog {
             .next_offset
             .checked_add(1)
             .ok_or(StorageError::OffsetOverflow)?;
+        if let Some(producer) = &record.producer {
+            self.producer_state
+                .insert(producer.id.clone(), (producer.sequence, offset));
+        }
         Ok(offset)
     }
 
@@ -388,6 +451,7 @@ fn recover_segment(
     path: &Path,
     mut next_offset: u64,
     index_interval_bytes: u64,
+    producer_state: &mut HashMap<String, (u64, u64)>,
 ) -> Result<(u64, u64, Vec<IndexEntry>), StorageError> {
     let contents = fs::read(path)?;
     let total_len = contents.len();
@@ -403,6 +467,27 @@ fn recover_segment(
                     expected: next_offset,
                     actual: record.offset(),
                 });
+            }
+            if let Some(producer) = &record.producer {
+                validate_producer_id(&producer.id)?;
+                match producer_state.get(&producer.id) {
+                    Some(&(sequence, _)) if producer.sequence != sequence.saturating_add(1) => {
+                        return Err(StorageError::UnexpectedProducerSequence {
+                            producer_id: producer.id.clone(),
+                            expected: sequence.saturating_add(1),
+                            actual: producer.sequence,
+                        });
+                    }
+                    None if producer.sequence != 0 => {
+                        return Err(StorageError::UnexpectedProducerSequence {
+                            producer_id: producer.id.clone(),
+                            expected: 0,
+                            actual: producer.sequence,
+                        });
+                    }
+                    Some(_) | None => {}
+                }
+                producer_state.insert(producer.id.clone(), (producer.sequence, record.offset()));
             }
             if index.last().is_none_or(|entry: &IndexEntry| {
                 position.saturating_sub(entry.position) >= index_interval_bytes
@@ -524,14 +609,44 @@ pub fn decode_record(buffer: &mut BytesMut) -> Result<Option<StoredRecord>, Stor
     }
 
     let version = encoded.get_u8();
-    if version != RECORD_VERSION {
+    if !matches!(version, RECORD_VERSION_V1 | RECORD_VERSION) {
         return Err(StorageError::UnsupportedVersion(version));
     }
 
     let offset = encoded.get_u64();
     let timestamp_ms = encoded.get_u64();
+    let producer = if version == RECORD_VERSION {
+        if encoded.remaining() < size_of::<i32>() + size_of::<u64>() {
+            return Err(StorageError::InvalidRecord);
+        }
+        let producer_len = encoded.get_i32();
+        let sequence = encoded.get_u64();
+        match producer_len {
+            -1 => None,
+            0.. => {
+                let len = usize::try_from(producer_len).map_err(|_| StorageError::InvalidRecord)?;
+                Some((len, sequence))
+            }
+            _ => return Err(StorageError::InvalidRecord),
+        }
+    } else {
+        None
+    };
+    if encoded.remaining() < size_of::<i32>() + size_of::<u32>() {
+        return Err(StorageError::InvalidRecord);
+    }
     let key_len = encoded.get_i32();
     let value_len = usize::try_from(encoded.get_u32()).map_err(|_| StorageError::RecordTooLarge)?;
+    let producer = producer
+        .map(
+            |(len, sequence)| -> Result<ProducerIdentity, StorageError> {
+                let id = read_bytes(&mut encoded, len)?;
+                let id =
+                    String::from_utf8(id.to_vec()).map_err(|_| StorageError::InvalidProducerId)?;
+                Ok(ProducerIdentity { id, sequence })
+            },
+        )
+        .transpose()?;
     let key = match key_len {
         -1 => None,
         0.. => {
@@ -551,12 +666,17 @@ pub fn decode_record(buffer: &mut BytesMut) -> Result<Option<StoredRecord>, Stor
         timestamp_ms,
         key,
         value,
+        producer,
     }))
 }
 
 fn encode_record(record: &Record, offset: u64) -> Result<BytesMut, StorageError> {
     let key_len = record.key.as_ref().map_or(0, Bytes::len);
-    let body_len = BODY_FIXED_SIZE + key_len + record.value.len();
+    let producer_len = record
+        .producer
+        .as_ref()
+        .map_or(0, |producer| producer.id.len());
+    let body_len = BODY_FIXED_SIZE + producer_len + key_len + record.value.len();
     let record_len = CRC_SIZE + body_len;
     if record_len > MAX_RECORD_SIZE {
         return Err(StorageError::RecordTooLarge);
@@ -566,6 +686,14 @@ fn encode_record(record: &Record, offset: u64) -> Result<BytesMut, StorageError>
     body.put_u8(RECORD_VERSION);
     body.put_u64(offset);
     body.put_u64(record.timestamp_ms);
+    if let Some(producer) = &record.producer {
+        validate_producer_id(&producer.id)?;
+        body.put_i32(i32::try_from(producer.id.len()).map_err(|_| StorageError::RecordTooLarge)?);
+        body.put_u64(producer.sequence);
+    } else {
+        body.put_i32(-1);
+        body.put_u64(0);
+    }
     match &record.key {
         Some(key) => {
             body.put_i32(i32::try_from(key.len()).map_err(|_| StorageError::RecordTooLarge)?);
@@ -573,6 +701,9 @@ fn encode_record(record: &Record, offset: u64) -> Result<BytesMut, StorageError>
         None => body.put_i32(-1),
     }
     body.put_u32(u32::try_from(record.value.len()).map_err(|_| StorageError::RecordTooLarge)?);
+    if let Some(producer) = &record.producer {
+        body.extend_from_slice(producer.id.as_bytes());
+    }
     if let Some(key) = &record.key {
         body.extend_from_slice(key);
     }
@@ -604,6 +735,18 @@ fn validate_topic(topic: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn validate_producer_id(producer_id: &str) -> Result<(), StorageError> {
+    if producer_id.is_empty()
+        || producer_id.len() > 249
+        || !producer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(StorageError::InvalidProducerId);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("storage I/O failed: {0}")]
@@ -618,6 +761,14 @@ pub enum StorageError {
     UnsupportedVersion(u8),
     #[error("topic name is invalid")]
     InvalidTopic,
+    #[error("producer id is invalid")]
+    InvalidProducerId,
+    #[error("producer {producer_id} expected sequence {expected}, received {actual}")]
+    UnexpectedProducerSequence {
+        producer_id: String,
+        expected: u64,
+        actual: u64,
+    },
     #[error("offset space is exhausted")]
     OffsetOverflow,
     #[error("expected offset {expected}, found {actual}")]
@@ -655,7 +806,10 @@ mod tests {
     use bytes::{Bytes, BytesMut};
     use tempfile::tempdir;
 
-    use super::{INDEX_ENTRY_SIZE, PartitionLog, Record, decode_record, discover_partitions};
+    use super::{
+        INDEX_ENTRY_SIZE, PartitionLog, ProducerIdentity, Record, decode_record,
+        discover_partitions,
+    };
 
     #[test]
     fn ignores_internal_broker_directories_during_partition_discovery() {
@@ -713,6 +867,38 @@ mod tests {
         assert_eq!(second.offset(), 1);
         assert_eq!(second.key(), None);
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn deduplicates_producer_sequences_after_recovery() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let first = Record::new(None, Bytes::from_static(b"hello"), 1)
+            .with_producer(ProducerIdentity::new("producer-a".to_owned(), 0));
+        {
+            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
+                .expect("partition log should be created");
+            assert_eq!(log.append(&first).expect("first append should work"), 0);
+            assert_eq!(log.append(&first).expect("retry should deduplicate"), 0);
+            assert_eq!(log.next_offset(), 1);
+            log.sync_data().expect("record should sync");
+        }
+
+        let mut recovered = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
+            .expect("producer state should recover");
+        assert_eq!(
+            recovered
+                .append(&first)
+                .expect("retry after recovery should deduplicate"),
+            0
+        );
+        let second = Record::new(None, Bytes::from_static(b"world"), 2)
+            .with_producer(ProducerIdentity::new("producer-a".to_owned(), 1));
+        assert_eq!(
+            recovered
+                .append(&second)
+                .expect("next sequence should append"),
+            1
+        );
     }
 
     #[test]
@@ -861,7 +1047,7 @@ mod tests {
     fn rotates_recovers_and_reads_across_segments() {
         let data_dir = tempdir().expect("temporary directory should be created");
         {
-            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 75, 64)
+            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 110, 64)
                 .expect("partition log should be created");
             for value in ["zero", "one", "two"] {
                 log.append(&Record::new(
@@ -885,7 +1071,7 @@ mod tests {
             );
         }
 
-        let log = PartitionLog::open(data_dir.path(), "payments", 0, 75, 64)
+        let log = PartitionLog::open(data_dir.path(), "payments", 0, 110, 64)
             .expect("partition log should recover");
         let records = log.read(1, 1024).expect("read should cross segments");
 

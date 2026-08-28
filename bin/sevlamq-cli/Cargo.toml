@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 bytes.workspace = true
 clap.workspace = true
+crc32fast.workspace = true
 sevlamq-client = { path = "../../crates/client" }
 sevlamq-protocol = { path = "../../crates/protocol" }
 thiserror.workspace = true

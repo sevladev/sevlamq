@@ -15,7 +15,9 @@ use sevlamq_protocol::{
     AckMode, FetchResponse, FetchedRecord, GroupFetchRequest, ProduceAck, Request, Response,
     decode_request, encode_response,
 };
-use sevlamq_storage::{PartitionLog, Record, discover_partitions};
+use sevlamq_storage::{
+    PartitionLog, ProducerIdentity as StorageProducerIdentity, Record, discover_partitions,
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -127,6 +129,9 @@ async fn handle_connection(
                             request.key().clone(),
                             request.payload().clone(),
                             request.ack_mode(),
+                            request.producer().map(|producer| {
+                                StorageProducerIdentity::new(producer.id.clone(), producer.sequence)
+                            }),
                         )
                         .await?;
                     debug!(
@@ -342,6 +347,7 @@ impl StorageHandle {
         key: Bytes,
         value: Bytes,
         ack_mode: AckMode,
+        producer: Option<StorageProducerIdentity>,
     ) -> Result<ProduceAck, ConnectionError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -350,6 +356,7 @@ impl StorageHandle {
                 key,
                 value,
                 ack_mode,
+                producer,
                 reply,
             })
             .await
@@ -417,6 +424,7 @@ enum StorageCommand {
         key: Bytes,
         value: Bytes,
         ack_mode: AckMode,
+        producer: Option<StorageProducerIdentity>,
         reply: oneshot::Sender<Result<ProduceAck, sevlamq_storage::StorageError>>,
     },
     Read {
@@ -433,6 +441,14 @@ struct StorageSettings {
     max_segment_bytes: u64,
     index_interval_bytes: u64,
     default_partition_count: u32,
+}
+
+struct AppendInput {
+    topic: String,
+    key: Bytes,
+    value: Bytes,
+    ack_mode: AckMode,
+    producer: Option<StorageProducerIdentity>,
 }
 
 type PartitionKey = (String, u32);
@@ -472,17 +488,17 @@ async fn start_storage_worker(
                     key,
                     value,
                     ack_mode,
+                    producer,
                     reply,
                 } => {
-                    let result = append_record(
-                        &settings,
-                        &mut logs,
-                        &mut round_robin,
-                        &topic,
+                    let input = AppendInput {
+                        topic,
                         key,
                         value,
                         ack_mode,
-                    );
+                        producer,
+                    };
+                    let result = append_record(&settings, &mut logs, &mut round_robin, input);
                     let _ = reply.send(result);
                 }
                 StorageCommand::Read {
@@ -550,14 +566,28 @@ fn append_record(
     settings: &StorageSettings,
     logs: &mut PartitionLogs,
     round_robin: &mut HashMap<String, u32>,
-    topic: &str,
-    key: Bytes,
-    value: Bytes,
-    ack_mode: AckMode,
+    input: AppendInput,
 ) -> Result<ProduceAck, sevlamq_storage::StorageError> {
-    ensure_topic_partitions(settings, logs, topic)?;
-    let partition = select_partition(settings.default_partition_count, round_robin, topic, &key);
-    let partition_key = (topic.to_owned(), partition);
+    let AppendInput {
+        topic,
+        key,
+        value,
+        ack_mode,
+        producer,
+    } = input;
+    ensure_topic_partitions(settings, logs, &topic)?;
+    let routing_key = if key.is_empty() {
+        producer.as_ref().map(|producer| producer.id().as_bytes())
+    } else {
+        Some(key.as_ref())
+    };
+    let partition = select_partition(
+        settings.default_partition_count,
+        round_robin,
+        &topic,
+        routing_key,
+    );
+    let partition_key = (topic, partition);
     let log = logs
         .get_mut(&partition_key)
         .ok_or(sevlamq_storage::StorageError::InvalidTopic)?;
@@ -569,7 +599,11 @@ fn append_record(
     )
     .map_err(|_| sevlamq_storage::StorageError::InvalidTimestamp)?;
     let key = (!key.is_empty()).then_some(key);
-    let offset = log.append(&Record::new(key, value, timestamp_ms))?;
+    let mut record = Record::new(key, value, timestamp_ms);
+    if let Some(producer) = producer {
+        record = record.with_producer(producer);
+    }
+    let offset = log.append(&record)?;
     if ack_mode == AckMode::Durable {
         log.sync_data()?;
     }
@@ -600,9 +634,9 @@ fn select_partition(
     partition_count: u32,
     round_robin: &mut HashMap<String, u32>,
     topic: &str,
-    key: &Bytes,
+    key: Option<&[u8]>,
 ) -> u32 {
-    if !key.is_empty() {
+    if let Some(key) = key {
         return crc32fast::hash(key) % partition_count;
     }
 
@@ -724,11 +758,17 @@ mod tests {
         let mut round_robin = HashMap::new();
         let key = Bytes::from_static(b"customer-123");
 
-        assert_eq!(select_partition(3, &mut round_robin, "payments", &key), 1);
-        assert_eq!(select_partition(3, &mut round_robin, "payments", &key), 1);
+        assert_eq!(
+            select_partition(3, &mut round_robin, "payments", Some(&key)),
+            1
+        );
+        assert_eq!(
+            select_partition(3, &mut round_robin, "payments", Some(&key)),
+            1
+        );
 
         let selected: Vec<u32> = (0..4)
-            .map(|_| select_partition(3, &mut round_robin, "payments", &Bytes::new()))
+            .map(|_| select_partition(3, &mut round_robin, "payments", None))
             .collect();
         assert_eq!(selected, [0, 1, 2, 0]);
     }
@@ -785,6 +825,7 @@ mod tests {
                 Bytes::new(),
                 Bytes::from_static(b"hello"),
                 AckMode::Durable,
+                None,
             )
             .await
             .expect("append should wake waiting fetch");
@@ -858,6 +899,7 @@ mod tests {
                         Bytes::from_static(b"customer-123"),
                         Bytes::copy_from_slice(value.as_bytes()),
                         AckMode::Leader,
+                        None,
                     )
                     .await
                     .expect("broker should acknowledge produce");
