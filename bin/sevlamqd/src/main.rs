@@ -13,7 +13,7 @@ async fn main() -> Result<(), AppError> {
         .map_or_else(|| PathBuf::from("config/sevlamq.toml"), PathBuf::from);
     let config = Config::from_file(config_path)?;
 
-    sevlamq_broker::run(&config.broker).await?;
+    sevlamq_broker::run(&config.broker, &config.admin).await?;
     Ok(())
 }
 

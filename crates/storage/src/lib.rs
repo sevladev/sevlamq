@@ -383,6 +383,11 @@ impl PartitionLog {
         &self.segments
     }
 
+    #[must_use]
+    pub fn log_size_bytes(&self) -> u64 {
+        self.segments.iter().map(SegmentMetadata::len).sum()
+    }
+
     fn rotate(&mut self) -> Result<(), StorageError> {
         self.active_file.flush()?;
         self.active_index_file.flush()?;

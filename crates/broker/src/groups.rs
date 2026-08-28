@@ -20,6 +20,17 @@ struct ConsumerGroup {
     generation: u64,
     members: BTreeMap<String, Instant>,
     assignments: HashMap<String, Vec<u32>>,
+    committed_offsets: HashMap<u32, u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupSnapshot {
+    pub group: String,
+    pub topic: String,
+    pub generation: u64,
+    pub members: usize,
+    pub assigned_partitions: usize,
+    pub committed_offsets: Vec<(u32, u64)>,
 }
 
 impl GroupCoordinator {
@@ -30,11 +41,12 @@ impl GroupCoordinator {
     ) -> Result<Self, GroupError> {
         let offsets_dir = data_dir.join("__consumer_offsets");
         fs::create_dir_all(&offsets_dir)?;
+        let groups = recover_groups(&offsets_dir, partition_count)?;
         Ok(Self {
             offsets_dir,
             partition_count,
             session_timeout,
-            groups: HashMap::new(),
+            groups,
         })
     }
 
@@ -48,10 +60,16 @@ impl GroupCoordinator {
         validate_id(topic)?;
         validate_id(member)?;
         let key = (group.to_owned(), topic.to_owned());
+        let committed_offsets = if self.groups.contains_key(&key) {
+            HashMap::new()
+        } else {
+            load_offsets(&self.offsets_dir, group, topic, self.partition_count)?
+        };
         let consumer_group = self.groups.entry(key).or_insert_with(|| ConsumerGroup {
             generation: 0,
             members: BTreeMap::new(),
             assignments: HashMap::new(),
+            committed_offsets,
         });
         let members_expired = expire_members(consumer_group, self.session_timeout);
         let is_new = consumer_group
@@ -106,6 +124,7 @@ impl GroupCoordinator {
         partition: u32,
         offset: u64,
     ) -> Result<(), GroupError> {
+        let offsets_dir = self.offsets_dir.clone();
         let consumer_group = self.active_group(identity.group, identity.topic)?;
         validate_member(consumer_group, identity.member, identity.generation)?;
         if !consumer_group
@@ -116,12 +135,14 @@ impl GroupCoordinator {
             return Err(GroupError::PartitionNotAssigned(partition));
         }
         persist_offset(
-            &self.offsets_dir,
+            &offsets_dir,
             identity.group,
             identity.topic,
             partition,
             offset,
-        )
+        )?;
+        consumer_group.committed_offsets.insert(partition, offset);
+        Ok(())
     }
 
     pub fn authorize_fetch(
@@ -170,6 +191,34 @@ impl GroupCoordinator {
         Ok(())
     }
 
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<GroupSnapshot> {
+        let mut snapshots: Vec<_> = self
+            .groups
+            .iter()
+            .map(|((group, topic), state)| {
+                let mut committed_offsets: Vec<_> = state
+                    .committed_offsets
+                    .iter()
+                    .map(|(partition, offset)| (*partition, *offset))
+                    .collect();
+                committed_offsets.sort_unstable_by_key(|(partition, _)| *partition);
+                GroupSnapshot {
+                    group: group.clone(),
+                    topic: topic.clone(),
+                    generation: state.generation,
+                    members: state.members.len(),
+                    assigned_partitions: state.assignments.values().map(Vec::len).sum(),
+                    committed_offsets,
+                }
+            })
+            .collect();
+        snapshots.sort_unstable_by(|left, right| {
+            (&left.group, &left.topic).cmp(&(&right.group, &right.topic))
+        });
+        snapshots
+    }
+
     fn active_group(&mut self, group: &str, topic: &str) -> Result<&mut ConsumerGroup, GroupError> {
         let consumer_group = self
             .groups
@@ -180,6 +229,69 @@ impl GroupCoordinator {
         }
         Ok(consumer_group)
     }
+}
+
+fn recover_groups(
+    root: &Path,
+    partition_count: u32,
+) -> Result<HashMap<(String, String), ConsumerGroup>, GroupError> {
+    let mut groups = HashMap::new();
+    for group_entry in fs::read_dir(root)? {
+        let group_entry = group_entry?;
+        if !group_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let group = group_entry
+            .file_name()
+            .into_string()
+            .map_err(|_| GroupError::InvalidId)?;
+        validate_id(&group)?;
+        for topic_entry in fs::read_dir(group_entry.path())? {
+            let topic_entry = topic_entry?;
+            if !topic_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let topic = topic_entry
+                .file_name()
+                .into_string()
+                .map_err(|_| GroupError::InvalidId)?;
+            validate_id(&topic)?;
+            groups.insert(
+                (group.clone(), topic.clone()),
+                ConsumerGroup {
+                    generation: 0,
+                    members: BTreeMap::new(),
+                    assignments: HashMap::new(),
+                    committed_offsets: load_offsets(root, &group, &topic, partition_count)?,
+                },
+            );
+        }
+    }
+    Ok(groups)
+}
+
+fn load_offsets(
+    root: &Path,
+    group: &str,
+    topic: &str,
+    partition_count: u32,
+) -> Result<HashMap<u32, u64>, GroupError> {
+    let mut offsets = HashMap::new();
+    for partition in 0..partition_count {
+        let path = offset_path(root, group, topic, partition);
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                let offset = contents
+                    .trim()
+                    .parse()
+                    .map_err(|_| GroupError::InvalidOffsetFile)?;
+                offsets.insert(partition, offset);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(offsets)
 }
 
 pub struct GroupIdentity<'a> {
@@ -349,5 +461,9 @@ mod tests {
                 .expect("offset should load"),
             Some(42)
         );
+        let snapshots = recovered.snapshot();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].members, 0);
+        assert_eq!(snapshots[0].committed_offsets, [(0, 42)]);
     }
 }

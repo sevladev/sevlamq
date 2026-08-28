@@ -6,6 +6,23 @@ use thiserror::Error;
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Config {
     pub broker: BrokerConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct AdminConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_owned(),
+            port: 7401,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -34,6 +51,14 @@ impl BrokerConfig {
     }
 }
 
+impl AdminConfig {
+    pub fn socket_addr(&self) -> Result<SocketAddr, ConfigError> {
+        format!("{}:{}", self.host, self.port)
+            .parse()
+            .map_err(ConfigError::AdminAddress)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read configuration: {0}")]
@@ -42,6 +67,8 @@ pub enum ConfigError {
     Parse(toml::de::Error),
     #[error("invalid broker address: {0}")]
     Address(std::net::AddrParseError),
+    #[error("invalid administrative address: {0}")]
+    AdminAddress(std::net::AddrParseError),
 }
 
 #[cfg(test)]
@@ -72,6 +99,7 @@ mod tests {
         assert_eq!(config.broker.index_interval_bytes, 4096);
         assert_eq!(config.broker.default_partition_count, 3);
         assert_eq!(config.broker.group_session_timeout_ms, 10_000);
+        assert_eq!(config.admin, super::AdminConfig::default());
         assert_eq!(
             config.broker.socket_addr().expect("address should parse"),
             "127.0.0.1:7400".parse().expect("test address should parse")

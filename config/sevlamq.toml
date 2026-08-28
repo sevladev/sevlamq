@@ -6,3 +6,7 @@ max_segment_bytes = 268435456
 index_interval_bytes = 4096
 default_partition_count = 3
 group_session_timeout_ms = 10000
+
+[admin]
+host = "127.0.0.1"
+port = 7401

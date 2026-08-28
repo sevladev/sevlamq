@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use sevlamq_common::BrokerConfig;
+use sevlamq_common::{AdminConfig, BrokerConfig};
 use sevlamq_protocol::{
     AckMode, BatchRecord, FetchResponse, FetchedRecord, GroupFetchRequest, ProduceAck, Request,
     Response, decode_request, encode_response,
@@ -29,13 +29,15 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 mod groups;
+mod observability;
 
 use groups::{GroupCoordinator, GroupIdentity};
+use observability::RuntimeMetrics;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 const STORAGE_QUEUE_CAPACITY: usize = 1024;
 
-pub async fn run(config: &BrokerConfig) -> Result<(), BrokerError> {
+pub async fn run(config: &BrokerConfig, admin_config: &AdminConfig) -> Result<(), BrokerError> {
     let address = config.socket_addr()?;
     let (storage, storage_worker) = start_storage_worker(
         PathBuf::from(&config.data_dir),
@@ -45,14 +47,17 @@ pub async fn run(config: &BrokerConfig) -> Result<(), BrokerError> {
     )
     .await?;
     let listener = TcpListener::bind(address).await?;
+    let admin_address = admin_config.socket_addr()?;
+    let admin_listener = TcpListener::bind(admin_address).await?;
     let groups = GroupHandle::open(
         Path::new(&config.data_dir),
         config.default_partition_count,
         Duration::from_millis(config.group_session_timeout_ms),
     )?;
 
-    info!(%address, data_dir = %config.data_dir, "broker started");
-    accept_connections(&listener, storage.clone(), groups).await?;
+    let metrics = Arc::new(RuntimeMetrics::default());
+    info!(%address, %admin_address, data_dir = %config.data_dir, "broker started");
+    accept_connections(&listener, &admin_listener, storage.clone(), groups, metrics).await?;
     info!("shutdown signal received");
 
     drop(storage);
@@ -64,8 +69,10 @@ pub async fn run(config: &BrokerConfig) -> Result<(), BrokerError> {
 
 async fn accept_connections(
     listener: &TcpListener,
+    admin_listener: &TcpListener,
     storage: StorageHandle,
     groups: GroupHandle,
+    metrics: Arc<RuntimeMetrics>,
 ) -> Result<(), BrokerError> {
     let mut connections = JoinSet::new();
 
@@ -78,7 +85,11 @@ async fn accept_connections(
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
                 let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-                connections.spawn(handle_connection(stream, peer, connection_id, storage.clone(), groups.clone()));
+                connections.spawn(handle_connection(stream, peer, connection_id, storage.clone(), groups.clone(), Arc::clone(&metrics)));
+            }
+            accepted = admin_listener.accept() => {
+                let (stream, _) = accepted?;
+                connections.spawn(handle_admin_connection(stream, storage.clone(), groups.clone(), Arc::clone(&metrics)));
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 report_connection_result(result);
@@ -99,10 +110,13 @@ async fn handle_connection(
     connection_id: u64,
     storage: StorageHandle,
     groups: GroupHandle,
+    metrics: Arc<RuntimeMetrics>,
 ) -> Result<(), ConnectionError> {
     let mut read_buffer = BytesMut::with_capacity(8 * 1024);
     let mut write_buffer = BytesMut::with_capacity(128);
     debug!(connection_id, %peer, "connection opened");
+    metrics.connection_opened();
+    let _connection_guard = ConnectionGuard(Arc::clone(&metrics));
 
     loop {
         let bytes_read = stream.read_buf(&mut read_buffer).await?;
@@ -114,92 +128,99 @@ async fn handle_connection(
         }
 
         while let Some(request) = decode_request(&mut read_buffer)? {
-            match request {
-                Request::Produce(request) => {
-                    debug!(
-                        connection_id,
-                        %peer,
-                        topic = %request.topic(),
-                        payload_bytes = request.payload().len(),
-                        "produce received"
-                    );
-                    let ack = storage
-                        .append(
-                            request.topic().to_owned(),
-                            request.key().clone(),
-                            request.payload().clone(),
-                            request.ack_mode(),
-                            request.producer().map(|producer| {
-                                StorageProducerIdentity::new(producer.id.clone(), producer.sequence)
-                            }),
-                        )
-                        .await?;
-                    debug!(
-                        connection_id,
-                        %peer,
-                        topic = %request.topic(),
-                        partition = ack.partition,
-                        offset = ack.offset,
-                        "produce appended"
-                    );
-                    encode_response(&Response::ProduceAck(ack), &mut write_buffer)?;
-                    stream.write_all(&write_buffer).await?;
-                    write_buffer.clear();
-                }
-                Request::ProduceBatch(request) => {
-                    let response = produce_batch(&storage, connection_id, peer, &request).await?;
-                    encode_response(&response, &mut write_buffer)?;
-                    stream.write_all(&write_buffer).await?;
-                    write_buffer.clear();
-                }
-                Request::Fetch(request) => {
-                    debug!(
-                        connection_id,
-                        %peer,
-                        topic = %request.topic(),
-                        partition = request.partition(),
-                        offset = request.offset(),
-                        max_bytes = request.max_bytes(),
-                        "fetch received"
-                    );
-                    let records = storage
-                        .read(
-                            request.topic().to_owned(),
-                            request.partition(),
-                            request.offset(),
-                            request.max_bytes(),
-                            request.max_wait_ms(),
-                        )
-                        .await?;
-                    encode_response(
-                        &Response::Fetch(FetchResponse::new(records)),
-                        &mut write_buffer,
-                    )?;
-                    stream.write_all(&write_buffer).await?;
-                    write_buffer.clear();
-                }
-                Request::GroupFetch(request) => {
-                    let response = group_fetch(&storage, &groups, request).await?;
-                    encode_response(&response, &mut write_buffer)?;
-                    stream.write_all(&write_buffer).await?;
-                    write_buffer.clear();
-                }
-                request @ (Request::JoinGroup(_)
-                | Request::Heartbeat(_)
-                | Request::LeaveGroup(_)
-                | Request::CommitOffset(_)
-                | Request::FetchCommittedOffset(_)) => {
-                    let response = groups.execute(request).await;
-                    encode_response(&response, &mut write_buffer)?;
-                    stream.write_all(&write_buffer).await?;
-                    write_buffer.clear();
-                }
-            }
+            let response =
+                process_request(request, &storage, &groups, &metrics, connection_id, peer).await?;
+            encode_response(&response, &mut write_buffer)?;
+            stream.write_all(&write_buffer).await?;
+            write_buffer.clear();
         }
     }
 
     debug!(connection_id, %peer, "connection closed");
     Ok(())
+}
+
+async fn process_request(
+    request: Request,
+    storage: &StorageHandle,
+    groups: &GroupHandle,
+    metrics: &RuntimeMetrics,
+    connection_id: u64,
+    peer: SocketAddr,
+) -> Result<Response, ConnectionError> {
+    match request {
+        Request::Produce(request) => {
+            debug!(connection_id, %peer, topic = %request.topic(), "produce received");
+            let ack = storage
+                .append(
+                    request.topic().to_owned(),
+                    request.key().clone(),
+                    request.payload().clone(),
+                    request.ack_mode(),
+                    request.producer().map(|producer| {
+                        StorageProducerIdentity::new(producer.id.clone(), producer.sequence)
+                    }),
+                )
+                .await?;
+            metrics.produced(1, request.payload().len());
+            Ok(Response::ProduceAck(ack))
+        }
+        Request::ProduceBatch(request) => {
+            let response = produce_batch(storage, connection_id, peer, &request).await?;
+            metrics.produced(
+                request.records().len(),
+                request
+                    .records()
+                    .iter()
+                    .map(|record| record.payload.len())
+                    .sum(),
+            );
+            Ok(response)
+        }
+        Request::Fetch(request) => {
+            let records = storage
+                .read(
+                    request.topic().to_owned(),
+                    request.partition(),
+                    request.offset(),
+                    request.max_bytes(),
+                    request.max_wait_ms(),
+                )
+                .await?;
+            metrics.fetched(
+                records.len(),
+                records.iter().map(|record| record.value.len()).sum(),
+            );
+            Ok(Response::Fetch(FetchResponse::new(records)))
+        }
+        Request::GroupFetch(request) => {
+            let response = group_fetch(storage, groups, request).await?;
+            if let Response::Fetch(fetch) = &response {
+                metrics.fetched(
+                    fetch.records().len(),
+                    fetch
+                        .records()
+                        .iter()
+                        .map(|record| record.value.len())
+                        .sum(),
+                );
+            }
+            Ok(response)
+        }
+        request @ (Request::JoinGroup(_)
+        | Request::Heartbeat(_)
+        | Request::LeaveGroup(_)
+        | Request::CommitOffset(_)
+        | Request::FetchCommittedOffset(_)) => Ok(groups.execute(request).await),
+    }
+}
+
+struct ConnectionGuard(Arc<RuntimeMetrics>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.connection_closed();
+    }
 }
 
 async fn produce_batch(
@@ -249,6 +270,244 @@ async fn group_fetch(
     }
 }
 
+async fn handle_admin_connection(
+    mut stream: TcpStream,
+    storage: StorageHandle,
+    groups: GroupHandle,
+    metrics: Arc<RuntimeMetrics>,
+) -> Result<(), ConnectionError> {
+    const MAX_REQUEST_BYTES: usize = 8 * 1024;
+    let mut request = BytesMut::with_capacity(1024);
+    loop {
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if request.len() >= MAX_REQUEST_BYTES {
+            write_http_response(&mut stream, "413 Payload Too Large", "text/plain", "").await?;
+            return Ok(());
+        }
+        if stream.read_buf(&mut request).await? == 0 {
+            return Ok(());
+        }
+    }
+    let request_line = request
+        .as_ref()
+        .split(|byte| *byte == b'\n')
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .unwrap_or_default();
+    let path = request_line.split_ascii_whitespace().nth(1);
+    match path {
+        Some("/health/live" | "/health/ready") => {
+            write_http_response(&mut stream, "200 OK", "text/plain", "ok\n").await
+        }
+        Some("/metrics") => {
+            let queue_depth = storage.queue_depth();
+            let partitions = storage.snapshot().await?;
+            let group_snapshots = groups.snapshot().await?;
+            let body = render_metrics(&metrics, queue_depth, &partitions, &group_snapshots);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "text/plain; version=0.0.4; charset=utf-8",
+                &body,
+            )
+            .await
+        }
+        _ => write_http_response(&mut stream, "404 Not Found", "text/plain", "not found\n").await,
+    }
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<(), ConnectionError> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(body.as_bytes()).await?;
+    Ok(())
+}
+
+fn render_metrics(
+    metrics: &RuntimeMetrics,
+    storage_queue_depth: usize,
+    partitions: &[PartitionSnapshot],
+    groups: &[groups::GroupSnapshot],
+) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(8 * 1024);
+    metrics.render(&mut output);
+    output.push_str(
+        "# HELP sevlamq_storage_queue_depth Commands waiting in the storage worker queue.\n",
+    );
+    output.push_str("# TYPE sevlamq_storage_queue_depth gauge\n");
+    let _ = writeln!(output, "sevlamq_storage_queue_depth {storage_queue_depth}");
+    output.push_str("# HELP sevlamq_topic_partitions Number of partitions in a topic.\n");
+    output.push_str("# TYPE sevlamq_topic_partitions gauge\n");
+    let mut topic_counts = std::collections::BTreeMap::<&str, usize>::new();
+    for partition in partitions {
+        *topic_counts.entry(&partition.topic).or_default() += 1;
+    }
+    for (topic, count) in topic_counts {
+        let topic = observability::escape_label(topic);
+        let _ = writeln!(
+            output,
+            "sevlamq_topic_partitions{{topic=\"{topic}\"}} {count}"
+        );
+    }
+    output.push_str("# HELP sevlamq_topic_high_watermark_sum Sum of partition high watermarks.\n");
+    output.push_str("# TYPE sevlamq_topic_high_watermark_sum gauge\n");
+    output.push_str(
+        "# HELP sevlamq_topic_log_size_bytes Bytes stored by all partitions of a topic.\n",
+    );
+    output.push_str("# TYPE sevlamq_topic_log_size_bytes gauge\n");
+    let mut topic_totals = std::collections::BTreeMap::<&str, (u64, u64)>::new();
+    for partition in partitions {
+        let totals = topic_totals.entry(&partition.topic).or_default();
+        totals.0 = totals.0.saturating_add(partition.high_watermark);
+        totals.1 = totals.1.saturating_add(partition.log_size_bytes);
+    }
+    for (topic, (high_watermark, size)) in topic_totals {
+        let topic = observability::escape_label(topic);
+        let _ = writeln!(
+            output,
+            "sevlamq_topic_high_watermark_sum{{topic=\"{topic}\"}} {high_watermark}"
+        );
+        let _ = writeln!(
+            output,
+            "sevlamq_topic_log_size_bytes{{topic=\"{topic}\"}} {size}"
+        );
+    }
+    render_partition_metrics(&mut output, partitions);
+    render_group_metrics(&mut output, partitions, groups);
+    output
+}
+
+fn render_partition_metrics(output: &mut String, partitions: &[PartitionSnapshot]) {
+    use std::fmt::Write as _;
+    output.push_str("# HELP sevlamq_partition_high_watermark Next offset of a partition.\n");
+    output.push_str("# TYPE sevlamq_partition_high_watermark gauge\n");
+    output.push_str("# HELP sevlamq_partition_low_watermark Earliest available offset.\n");
+    output.push_str("# TYPE sevlamq_partition_low_watermark gauge\n");
+    output
+        .push_str("# HELP sevlamq_partition_records Records currently retained in a partition.\n");
+    output.push_str("# TYPE sevlamq_partition_records gauge\n");
+    output.push_str("# HELP sevlamq_partition_log_size_bytes Bytes stored in partition logs.\n");
+    output.push_str("# TYPE sevlamq_partition_log_size_bytes gauge\n");
+    output.push_str("# HELP sevlamq_partition_segments Number of log segments.\n");
+    output.push_str("# TYPE sevlamq_partition_segments gauge\n");
+    for snapshot in partitions {
+        let topic = observability::escape_label(&snapshot.topic);
+        let labels = format!("topic=\"{topic}\",partition=\"{}\"", snapshot.partition);
+        let _ = writeln!(
+            output,
+            "sevlamq_partition_high_watermark{{{labels}}} {}",
+            snapshot.high_watermark
+        );
+        let _ = writeln!(output, "sevlamq_partition_low_watermark{{{labels}}} 0");
+        let _ = writeln!(
+            output,
+            "sevlamq_partition_records{{{labels}}} {}",
+            snapshot.high_watermark
+        );
+        let _ = writeln!(
+            output,
+            "sevlamq_partition_log_size_bytes{{{labels}}} {}",
+            snapshot.log_size_bytes
+        );
+        let _ = writeln!(
+            output,
+            "sevlamq_partition_segments{{{labels}}} {}",
+            snapshot.segments
+        );
+    }
+}
+
+fn render_group_metrics(
+    output: &mut String,
+    partitions: &[PartitionSnapshot],
+    groups: &[groups::GroupSnapshot],
+) {
+    use std::fmt::Write as _;
+    for (name, help) in [
+        (
+            "sevlamq_consumer_group_members",
+            "Active consumer group members.",
+        ),
+        (
+            "sevlamq_consumer_group_generation",
+            "Current consumer group generation.",
+        ),
+        (
+            "sevlamq_consumer_group_assigned_partitions",
+            "Partitions assigned to active members.",
+        ),
+        (
+            "sevlamq_consumer_group_committed_offset",
+            "Committed next offset for a partition.",
+        ),
+        (
+            "sevlamq_consumer_group_lag",
+            "Records between the committed offset and high watermark.",
+        ),
+        (
+            "sevlamq_consumer_group_lag_total",
+            "Total consumer group lag across a topic.",
+        ),
+    ] {
+        let _ = writeln!(output, "# HELP {name} {help}");
+        let _ = writeln!(output, "# TYPE {name} gauge");
+    }
+    for group in groups {
+        let group_label = observability::escape_label(&group.group);
+        let topic_label = observability::escape_label(&group.topic);
+        let labels = format!("group=\"{group_label}\",topic=\"{topic_label}\"");
+        let _ = writeln!(
+            output,
+            "sevlamq_consumer_group_members{{{labels}}} {}",
+            group.members
+        );
+        let _ = writeln!(
+            output,
+            "sevlamq_consumer_group_generation{{{labels}}} {}",
+            group.generation
+        );
+        let _ = writeln!(
+            output,
+            "sevlamq_consumer_group_assigned_partitions{{{labels}}} {}",
+            group.assigned_partitions
+        );
+        let mut total_lag = 0_u64;
+        for partition in partitions.iter().filter(|item| item.topic == group.topic) {
+            let committed = group
+                .committed_offsets
+                .iter()
+                .find_map(|(id, offset)| (*id == partition.partition).then_some(*offset))
+                .unwrap_or_default();
+            let lag = partition.high_watermark.saturating_sub(committed);
+            total_lag = total_lag.saturating_add(lag);
+            let partition_labels = format!("{labels},partition=\"{}\"", partition.partition);
+            let _ = writeln!(
+                output,
+                "sevlamq_consumer_group_committed_offset{{{partition_labels}}} {committed}"
+            );
+            let _ = writeln!(
+                output,
+                "sevlamq_consumer_group_lag{{{partition_labels}}} {lag}"
+            );
+        }
+        let _ = writeln!(
+            output,
+            "sevlamq_consumer_group_lag_total{{{labels}}} {total_lag}"
+        );
+    }
+}
+
 #[derive(Clone)]
 struct GroupHandle {
     coordinator: Arc<std::sync::Mutex<GroupCoordinator>>,
@@ -278,6 +537,19 @@ impl GroupHandle {
             Ok(Err(error)) => Response::Error(error.to_string()),
             Err(error) => Response::Error(format!("group coordinator task failed: {error}")),
         }
+    }
+
+    async fn snapshot(&self) -> Result<Vec<groups::GroupSnapshot>, ConnectionError> {
+        let coordinator = Arc::clone(&self.coordinator);
+        tokio::task::spawn_blocking(move || {
+            coordinator
+                .lock()
+                .map_err(|_| groups::GroupError::CoordinatorPoisoned)
+                .map(|coordinator| coordinator.snapshot())
+        })
+        .await
+        .map_err(|_| ConnectionError::StorageUnavailable)?
+        .map_err(|_| ConnectionError::StorageUnavailable)
     }
 }
 
@@ -372,7 +644,31 @@ struct StorageHandle {
     new_records: Arc<Notify>,
 }
 
+#[derive(Debug, Clone)]
+struct PartitionSnapshot {
+    topic: String,
+    partition: u32,
+    high_watermark: u64,
+    log_size_bytes: u64,
+    segments: usize,
+}
+
 impl StorageHandle {
+    fn queue_depth(&self) -> usize {
+        self.sender.max_capacity() - self.sender.capacity()
+    }
+
+    async fn snapshot(&self) -> Result<Vec<PartitionSnapshot>, ConnectionError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::Snapshot { reply })
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        response
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)
+    }
+
     async fn append(
         &self,
         topic: String,
@@ -496,6 +792,9 @@ enum StorageCommand {
         max_bytes: u32,
         reply: oneshot::Sender<Result<Vec<FetchedRecord>, sevlamq_storage::StorageError>>,
     },
+    Snapshot {
+        reply: oneshot::Sender<Vec<PartitionSnapshot>>,
+    },
 }
 
 struct StorageSettings {
@@ -589,6 +888,22 @@ async fn start_storage_worker(
                     let result =
                         read_records(&settings, &mut logs, &topic, partition, offset, max_bytes);
                     let _ = reply.send(result);
+                }
+                StorageCommand::Snapshot { reply } => {
+                    let mut snapshots: Vec<_> = logs
+                        .iter()
+                        .map(|((topic, partition), log)| PartitionSnapshot {
+                            topic: topic.clone(),
+                            partition: *partition,
+                            high_watermark: log.next_offset(),
+                            log_size_bytes: log.log_size_bytes(),
+                            segments: log.segments().len(),
+                        })
+                        .collect();
+                    snapshots.sort_unstable_by(|left, right| {
+                        (&left.topic, left.partition).cmp(&(&right.topic, right.partition))
+                    });
+                    let _ = reply.send(snapshots);
                 }
             }
         }
@@ -856,7 +1171,7 @@ enum ConnectionError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::{collections::HashMap, fs, time::Duration};
+    use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
     use bytes::Bytes;
     use sevlamq_client::Client;
@@ -865,7 +1180,43 @@ mod tests {
     use tempfile::tempdir;
     use tokio::{net::TcpListener, time::timeout};
 
-    use super::{GroupHandle, handle_connection, select_partition, start_storage_worker};
+    use super::{
+        GroupHandle, PartitionSnapshot, RuntimeMetrics, handle_connection, render_metrics,
+        select_partition, start_storage_worker,
+    };
+
+    #[test]
+    fn renders_partition_and_consumer_group_lag_metrics() {
+        let metrics = RuntimeMetrics::default();
+        metrics.produced(2, 10);
+        let partitions = vec![PartitionSnapshot {
+            topic: "payments".to_owned(),
+            partition: 0,
+            high_watermark: 13,
+            log_size_bytes: 512,
+            segments: 2,
+        }];
+        let groups = vec![super::groups::GroupSnapshot {
+            group: "workers".to_owned(),
+            topic: "payments".to_owned(),
+            generation: 3,
+            members: 1,
+            assigned_partitions: 1,
+            committed_offsets: vec![(0, 8)],
+        }];
+
+        let rendered = render_metrics(&metrics, 0, &partitions, &groups);
+
+        assert!(rendered.contains("sevlamq_messages_produced_total 2"));
+        assert!(
+            rendered.contains(
+                "sevlamq_partition_log_size_bytes{topic=\"payments\",partition=\"0\"} 512"
+            )
+        );
+        assert!(rendered.contains(
+            "sevlamq_consumer_group_lag{group=\"workers\",topic=\"payments\",partition=\"0\"} 5"
+        ));
+    }
 
     #[test]
     fn selects_partitions_deterministically_and_round_robins_unkeyed_messages() {
@@ -1035,7 +1386,15 @@ mod tests {
                 .expect("group coordinator should start");
             let server = tokio::spawn(async move {
                 let (stream, peer) = listener.accept().await.expect("connection should arrive");
-                handle_connection(stream, peer, 1, connection_storage, groups).await
+                handle_connection(
+                    stream,
+                    peer,
+                    1,
+                    connection_storage,
+                    groups,
+                    Arc::new(RuntimeMetrics::default()),
+                )
+                .await
             });
 
             let mut client = Client::connect(address)
