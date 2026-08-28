@@ -12,8 +12,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use sevlamq_common::BrokerConfig;
 use sevlamq_protocol::{
-    AckMode, FetchResponse, FetchedRecord, GroupFetchRequest, ProduceAck, Request, Response,
-    decode_request, encode_response,
+    AckMode, BatchRecord, FetchResponse, FetchedRecord, GroupFetchRequest, ProduceAck, Request,
+    Response, decode_request, encode_response,
 };
 use sevlamq_storage::{
     PartitionLog, ProducerIdentity as StorageProducerIdentity, Record, discover_partitions,
@@ -146,6 +146,12 @@ async fn handle_connection(
                     stream.write_all(&write_buffer).await?;
                     write_buffer.clear();
                 }
+                Request::ProduceBatch(request) => {
+                    let response = produce_batch(&storage, connection_id, peer, &request).await?;
+                    encode_response(&response, &mut write_buffer)?;
+                    stream.write_all(&write_buffer).await?;
+                    write_buffer.clear();
+                }
                 Request::Fetch(request) => {
                     debug!(
                         connection_id,
@@ -194,6 +200,30 @@ async fn handle_connection(
 
     debug!(connection_id, %peer, "connection closed");
     Ok(())
+}
+
+async fn produce_batch(
+    storage: &StorageHandle,
+    connection_id: u64,
+    peer: SocketAddr,
+    request: &sevlamq_protocol::ProduceBatchRequest,
+) -> Result<Response, ConnectionError> {
+    debug!(
+        connection_id,
+        %peer,
+        topic = %request.topic(),
+        records = request.records().len(),
+        compression = ?request.compression(),
+        "produce batch received"
+    );
+    storage
+        .append_batch(
+            request.topic().to_owned(),
+            request.records().to_vec(),
+            request.ack_mode(),
+        )
+        .await
+        .map(Response::ProduceBatchAck)
 }
 
 async fn group_fetch(
@@ -330,7 +360,9 @@ fn execute_group_request(
                 request.partition,
             )
             .map(|()| Response::GroupAck),
-        Request::Produce(_) | Request::Fetch(_) => unreachable!("group requests are filtered"),
+        Request::Produce(_) | Request::ProduceBatch(_) | Request::Fetch(_) => {
+            unreachable!("group requests are filtered")
+        }
     }
 }
 
@@ -367,6 +399,30 @@ impl StorageHandle {
             .map_err(ConnectionError::Storage)?;
         self.new_records.notify_waiters();
         Ok(ack)
+    }
+
+    async fn append_batch(
+        &self,
+        topic: String,
+        records: Vec<BatchRecord>,
+        ack_mode: AckMode,
+    ) -> Result<Vec<ProduceAck>, ConnectionError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::AppendBatch {
+                topic,
+                records,
+                ack_mode,
+                reply,
+            })
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        let acks = response
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?
+            .map_err(ConnectionError::Storage)?;
+        self.new_records.notify_waiters();
+        Ok(acks)
     }
 
     async fn read(
@@ -426,6 +482,12 @@ enum StorageCommand {
         ack_mode: AckMode,
         producer: Option<StorageProducerIdentity>,
         reply: oneshot::Sender<Result<ProduceAck, sevlamq_storage::StorageError>>,
+    },
+    AppendBatch {
+        topic: String,
+        records: Vec<BatchRecord>,
+        ack_mode: AckMode,
+        reply: oneshot::Sender<Result<Vec<ProduceAck>, sevlamq_storage::StorageError>>,
     },
     Read {
         topic: String,
@@ -499,6 +561,22 @@ async fn start_storage_worker(
                         producer,
                     };
                     let result = append_record(&settings, &mut logs, &mut round_robin, input);
+                    let _ = reply.send(result);
+                }
+                StorageCommand::AppendBatch {
+                    topic,
+                    records,
+                    ack_mode,
+                    reply,
+                } => {
+                    let result = append_batch_records(
+                        &settings,
+                        &mut logs,
+                        &mut round_robin,
+                        &topic,
+                        records,
+                        ack_mode,
+                    );
                     let _ = reply.send(result);
                 }
                 StorageCommand::Read {
@@ -608,6 +686,42 @@ fn append_record(
         log.sync_data()?;
     }
     Ok(ProduceAck { partition, offset })
+}
+
+fn append_batch_records(
+    settings: &StorageSettings,
+    logs: &mut PartitionLogs,
+    round_robin: &mut HashMap<String, u32>,
+    topic: &str,
+    records: Vec<BatchRecord>,
+    ack_mode: AckMode,
+) -> Result<Vec<ProduceAck>, sevlamq_storage::StorageError> {
+    let mut acks = Vec::with_capacity(records.len());
+    for record in records {
+        acks.push(append_record(
+            settings,
+            logs,
+            round_robin,
+            AppendInput {
+                topic: topic.to_owned(),
+                key: record.key,
+                value: record.payload,
+                ack_mode: AckMode::Leader,
+                producer: None,
+            },
+        )?);
+    }
+    if ack_mode == AckMode::Durable {
+        let mut partitions: Vec<u32> = acks.iter().map(|ack| ack.partition).collect();
+        partitions.sort_unstable();
+        partitions.dedup();
+        for partition in partitions {
+            logs.get_mut(&(topic.to_owned(), partition))
+                .ok_or(sevlamq_storage::StorageError::InvalidTopic)?
+                .sync_data()?;
+        }
+    }
+    Ok(acks)
 }
 
 fn ensure_topic_partitions(
@@ -746,7 +860,7 @@ mod tests {
 
     use bytes::Bytes;
     use sevlamq_client::Client;
-    use sevlamq_protocol::AckMode;
+    use sevlamq_protocol::{AckMode, BatchRecord};
     use sevlamq_storage::{PartitionLog, Record};
     use tempfile::tempdir;
     use tokio::{net::TcpListener, time::timeout};
@@ -837,6 +951,42 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].offset, 0);
         assert_eq!(records[0].value, Bytes::from_static(b"hello"));
+        drop(storage);
+        storage_worker
+            .await
+            .expect("storage worker should finish")
+            .expect("storage should close cleanly");
+    }
+
+    #[tokio::test]
+    async fn appends_a_durable_batch_and_returns_each_offset() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let (storage, storage_worker) =
+            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 1)
+                .await
+                .expect("storage worker should start");
+
+        let acks = storage
+            .append_batch(
+                "payments".to_owned(),
+                vec![
+                    BatchRecord {
+                        key: Bytes::new(),
+                        payload: Bytes::from_static(b"hello"),
+                    },
+                    BatchRecord {
+                        key: Bytes::new(),
+                        payload: Bytes::from_static(b"world"),
+                    },
+                ],
+                AckMode::Durable,
+            )
+            .await
+            .expect("batch should append");
+
+        assert_eq!(acks.len(), 2);
+        assert_eq!(acks[0].offset, 0);
+        assert_eq!(acks[1].offset, 1);
         drop(storage);
         storage_worker
             .await

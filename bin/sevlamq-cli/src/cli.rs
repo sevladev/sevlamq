@@ -27,6 +27,18 @@ pub enum Command {
         #[arg(long, requires = "producer_id")]
         sequence: Option<u64>,
     },
+    /// Publishes multiple messages in one optionally compressed request.
+    ProduceBatch {
+        topic: String,
+        #[arg(long, required = true)]
+        message: Vec<String>,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long, value_enum, default_value_t = ProduceAcks::Leader)]
+        acks: ProduceAcks,
+        #[arg(long, value_enum, default_value_t = BatchCompression::None)]
+        compression: BatchCompression,
+    },
     /// Reads persisted records starting at an offset.
     Fetch {
         topic: String,
@@ -76,6 +88,12 @@ pub enum Command {
 pub enum ProduceAcks {
     Leader,
     Durable,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum BatchCompression {
+    None,
+    Zstd,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -144,7 +162,7 @@ pub enum GroupCommand {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, GroupCommand};
+    use super::{BatchCompression, Cli, Command, GroupCommand};
 
     #[test]
     fn parses_produce_command() {
@@ -163,6 +181,31 @@ mod tests {
             Command::Produce { topic, message, key, .. }
                 if topic == "payments" && message == "hello"
                     && key.as_deref() == Some("customer-123")
+        ));
+    }
+
+    #[test]
+    fn parses_zstd_produce_batch() {
+        let cli = Cli::try_parse_from([
+            "sevlamq",
+            "produce-batch",
+            "payments",
+            "--message",
+            "hello",
+            "--message",
+            "world",
+            "--compression",
+            "zstd",
+        ])
+        .expect("produce batch command should parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::ProduceBatch {
+                message,
+                compression: BatchCompression::Zstd,
+                ..
+            } if message == ["hello", "world"]
         ));
     }
 

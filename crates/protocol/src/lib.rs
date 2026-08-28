@@ -5,12 +5,16 @@ pub const MAX_TOPIC_NAME: usize = 249;
 pub const MAX_KEY_SIZE: usize = u16::MAX as usize;
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 pub const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
+pub const MAX_BATCH_MESSAGES: usize = 1_000;
+pub const MAX_UNCOMPRESSED_BATCH_SIZE: usize = 3 * 1024 * 1024;
 pub const MAX_FETCH_BYTES: usize = 3 * 1024 * 1024;
 pub const MAX_FETCH_WAIT_MS: u32 = 30_000;
 
 const FRAME_HEADER_SIZE: usize = size_of::<u32>();
 const PRODUCE: u8 = 0x01;
 const PRODUCE_ACK: u8 = 0x02;
+const PRODUCE_BATCH: u8 = 0x03;
+const PRODUCE_BATCH_ACK: u8 = 0x04;
 const FETCH: u8 = 0x10;
 const FETCH_RESPONSE: u8 = 0x11;
 const JOIN_GROUP: u8 = 0x20;
@@ -27,6 +31,7 @@ const GROUP_FETCH: u8 = 0x28;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Produce(ProduceRequest),
+    ProduceBatch(ProduceBatchRequest),
     Fetch(FetchRequest),
     JoinGroup(GroupMemberRequest),
     Heartbeat(GroupGenerationRequest),
@@ -34,6 +39,100 @@ pub enum Request {
     CommitOffset(CommitOffsetRequest),
     FetchCommittedOffset(FetchCommittedOffsetRequest),
     GroupFetch(GroupFetchRequest),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    None,
+    Zstd,
+}
+
+impl Compression {
+    const fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Zstd => 1,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, ProtocolError> {
+        match code {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Zstd),
+            _ => Err(ProtocolError::InvalidCompression(code)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchRecord {
+    pub key: Bytes,
+    pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProduceBatchRequest {
+    topic: String,
+    records: Vec<BatchRecord>,
+    ack_mode: AckMode,
+    compression: Compression,
+}
+
+impl ProduceBatchRequest {
+    pub fn new(
+        topic: String,
+        records: Vec<BatchRecord>,
+        ack_mode: AckMode,
+        compression: Compression,
+    ) -> Result<Self, ProtocolError> {
+        validate_topic(&topic)?;
+        if records.is_empty() || records.len() > MAX_BATCH_MESSAGES {
+            return Err(ProtocolError::InvalidBatchCount);
+        }
+        let mut encoded_size = size_of::<u32>();
+        for record in &records {
+            validate_size(record.key.len(), MAX_KEY_SIZE, ProtocolError::KeyTooLarge)?;
+            validate_size(
+                record.payload.len(),
+                MAX_MESSAGE_SIZE,
+                ProtocolError::MessageTooLarge,
+            )?;
+            encoded_size = encoded_size
+                .checked_add(2 + record.key.len() + 4 + record.payload.len())
+                .ok_or(ProtocolError::BatchTooLarge)?;
+        }
+        validate_size(
+            encoded_size,
+            MAX_UNCOMPRESSED_BATCH_SIZE,
+            ProtocolError::BatchTooLarge,
+        )?;
+        Ok(Self {
+            topic,
+            records,
+            ack_mode,
+            compression,
+        })
+    }
+
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    #[must_use]
+    pub fn records(&self) -> &[BatchRecord] {
+        &self.records
+    }
+
+    #[must_use]
+    pub const fn ack_mode(&self) -> AckMode {
+        self.ack_mode
+    }
+
+    #[must_use]
+    pub const fn compression(&self) -> Compression {
+        self.compression
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +334,7 @@ impl ProduceRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     ProduceAck(ProduceAck),
+    ProduceBatchAck(Vec<ProduceAck>),
     Fetch(FetchResponse),
     JoinGroup(JoinGroupResponse),
     GroupAck,
@@ -327,6 +427,9 @@ pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, Protocol
 
     match opcode {
         PRODUCE => decode_produce(frame).map(|request| Some(Request::Produce(request))),
+        PRODUCE_BATCH => {
+            decode_produce_batch(frame).map(|request| Some(Request::ProduceBatch(request)))
+        }
         FETCH => decode_fetch(frame).map(|request| Some(Request::Fetch(request))),
         JOIN_GROUP => decode_group_member(frame).map(|request| Some(Request::JoinGroup(request))),
         HEARTBEAT => {
@@ -348,6 +451,7 @@ pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, Protocol
 pub fn encode_request(request: &Request, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
     match request {
         Request::Produce(request) => encode_produce(request, buffer),
+        Request::ProduceBatch(request) => encode_produce_batch(request, buffer),
         Request::Fetch(request) => encode_fetch(request, buffer),
         Request::JoinGroup(request) => encode_group_member(JOIN_GROUP, request, buffer),
         Request::Heartbeat(request) => encode_group_generation(HEARTBEAT, request, buffer),
@@ -366,6 +470,18 @@ pub fn encode_response(response: &Response, buffer: &mut BytesMut) -> Result<(),
             buffer.put_u32(ack.partition);
             buffer.put_u64(ack.offset);
             Ok(())
+        }
+        Response::ProduceBatchAck(acks) => {
+            let start = buffer.len();
+            buffer.put_u32(0);
+            buffer.put_u8(PRODUCE_BATCH_ACK);
+            buffer
+                .put_u32(u32::try_from(acks.len()).map_err(|_| ProtocolError::InvalidBatchCount)?);
+            for ack in acks {
+                buffer.put_u32(ack.partition);
+                buffer.put_u64(ack.offset);
+            }
+            set_frame_len(buffer, start)
         }
         Response::Fetch(response) => encode_fetch_response(response, buffer),
         Response::JoinGroup(response) => {
@@ -437,6 +553,28 @@ pub fn decode_response(buffer: &mut BytesMut) -> Result<Option<Response>, Protoc
                 partition: frame.get_u32(),
                 offset: frame.get_u64(),
             })))
+        }
+        PRODUCE_BATCH_ACK => {
+            ensure_remaining(&frame, size_of::<u32>())?;
+            let count =
+                usize::try_from(frame.get_u32()).map_err(|_| ProtocolError::InvalidBatchCount)?;
+            if count == 0 || count > MAX_BATCH_MESSAGES {
+                return Err(ProtocolError::InvalidBatchCount);
+            }
+            ensure_remaining(
+                &frame,
+                count
+                    .checked_mul(size_of::<u32>() + size_of::<u64>())
+                    .ok_or(ProtocolError::InvalidFrame)?,
+            )?;
+            let acks = (0..count)
+                .map(|_| ProduceAck {
+                    partition: frame.get_u32(),
+                    offset: frame.get_u64(),
+                })
+                .collect();
+            ensure_empty(&frame)?;
+            Ok(Some(Response::ProduceBatchAck(acks)))
         }
         FETCH_RESPONSE => {
             decode_fetch_response(frame).map(|response| Some(Response::Fetch(response)))
@@ -523,6 +661,56 @@ fn decode_produce(mut frame: BytesMut) -> Result<ProduceRequest, ProtocolError> 
     ProduceRequest::new(topic, key, payload, ack_mode, producer)
 }
 
+fn decode_produce_batch(mut frame: BytesMut) -> Result<ProduceBatchRequest, ProtocolError> {
+    let topic_len = read_u16_len(&mut frame)?;
+    validate_size(topic_len, MAX_TOPIC_NAME, ProtocolError::TopicTooLarge)?;
+    let topic = read_bytes(&mut frame, topic_len)?;
+    let topic = String::from_utf8(topic.to_vec()).map_err(|_| ProtocolError::InvalidTopic)?;
+    ensure_remaining(&frame, 1 + 1 + 4 + 4)?;
+    let ack_mode = AckMode::from_code(frame.get_u8())?;
+    let compression = Compression::from_code(frame.get_u8())?;
+    let uncompressed_len = read_u32_len(&mut frame)?;
+    if uncompressed_len > MAX_UNCOMPRESSED_BATCH_SIZE {
+        return Err(ProtocolError::BatchTooLarge);
+    }
+    let encoded_len = read_u32_len(&mut frame)?;
+    let encoded = read_bytes(&mut frame, encoded_len)?;
+    ensure_empty(&frame)?;
+    let decoded = match compression {
+        Compression::None => encoded.to_vec(),
+        Compression::Zstd => zstd::bulk::decompress(&encoded, MAX_UNCOMPRESSED_BATCH_SIZE)
+            .map_err(|_| ProtocolError::InvalidCompressedBatch)?,
+    };
+    if decoded.len() != uncompressed_len {
+        return Err(ProtocolError::InvalidCompressedBatch);
+    }
+    let records = decode_batch_records(BytesMut::from(decoded.as_slice()))?;
+    ProduceBatchRequest::new(topic, records, ack_mode, compression)
+}
+
+fn decode_batch_records(mut encoded: BytesMut) -> Result<Vec<BatchRecord>, ProtocolError> {
+    let count = read_u32_len(&mut encoded)?;
+    if count == 0 || count > MAX_BATCH_MESSAGES {
+        return Err(ProtocolError::InvalidBatchCount);
+    }
+    let mut records = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key_len = read_u16_len(&mut encoded)?;
+        validate_size(key_len, MAX_KEY_SIZE, ProtocolError::KeyTooLarge)?;
+        let key = read_bytes(&mut encoded, key_len)?;
+        let payload_len = read_u32_len(&mut encoded)?;
+        validate_size(
+            payload_len,
+            MAX_MESSAGE_SIZE,
+            ProtocolError::MessageTooLarge,
+        )?;
+        let payload = read_bytes(&mut encoded, payload_len)?;
+        records.push(BatchRecord { key, payload });
+    }
+    ensure_empty(&encoded)?;
+    Ok(records)
+}
+
 fn decode_fetch(mut frame: BytesMut) -> Result<FetchRequest, ProtocolError> {
     let topic_len = read_u16_len(&mut frame)?;
     validate_size(topic_len, MAX_TOPIC_NAME, ProtocolError::TopicTooLarge)?;
@@ -576,6 +764,43 @@ fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(),
         buffer.put_u64(0);
     }
     Ok(())
+}
+
+fn encode_produce_batch(
+    request: &ProduceBatchRequest,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    let mut records = BytesMut::new();
+    records.put_u32(
+        u32::try_from(request.records.len()).map_err(|_| ProtocolError::InvalidBatchCount)?,
+    );
+    for record in &request.records {
+        records.put_u16(u16::try_from(record.key.len()).map_err(|_| ProtocolError::KeyTooLarge)?);
+        records.extend_from_slice(&record.key);
+        records.put_u32(
+            u32::try_from(record.payload.len()).map_err(|_| ProtocolError::MessageTooLarge)?,
+        );
+        records.extend_from_slice(&record.payload);
+    }
+    let encoded = match request.compression {
+        Compression::None => records.to_vec(),
+        Compression::Zstd => {
+            zstd::bulk::compress(&records, 3).map_err(|_| ProtocolError::InvalidCompressedBatch)?
+        }
+    };
+    let start = buffer.len();
+    buffer.put_u32(0);
+    buffer.put_u8(PRODUCE_BATCH);
+    buffer.put_u16(u16::try_from(request.topic.len()).map_err(|_| ProtocolError::TopicTooLarge)?);
+    buffer.extend_from_slice(request.topic.as_bytes());
+    buffer.put_u8(request.ack_mode.code());
+    buffer.put_u8(request.compression.code());
+    buffer.put_u32(u32::try_from(records.len()).map_err(|_| ProtocolError::BatchTooLarge)?);
+    buffer.put_u32(u32::try_from(encoded.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
+    buffer.extend_from_slice(&encoded);
+    set_frame_len(buffer, start)?;
+    let frame_len = buffer.len() - start - FRAME_HEADER_SIZE;
+    validate_size(frame_len, MAX_FRAME_SIZE, ProtocolError::FrameTooLarge)
 }
 
 fn encode_fetch(request: &FetchRequest, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
@@ -964,6 +1189,14 @@ pub enum ProtocolError {
     InvalidAckMode(u8),
     #[error("producer id is invalid")]
     InvalidProducerId,
+    #[error("batch must contain between 1 and {MAX_BATCH_MESSAGES} messages")]
+    InvalidBatchCount,
+    #[error("uncompressed batch exceeds the configured limit")]
+    BatchTooLarge,
+    #[error("compression codec {0} is not supported")]
+    InvalidCompression(u8),
+    #[error("compressed batch is malformed or does not match its declared size")]
+    InvalidCompressedBatch,
 }
 
 #[cfg(test)]
@@ -972,8 +1205,9 @@ mod tests {
     use bytes::{BufMut, Bytes, BytesMut};
 
     use super::{
-        FetchRequest, FetchResponse, FetchedRecord, MAX_FRAME_SIZE, ProduceRequest, ProtocolError,
-        Request, Response, decode_request, decode_response, encode_request, encode_response,
+        AckMode, BatchRecord, Compression, FetchRequest, FetchResponse, FetchedRecord,
+        MAX_FRAME_SIZE, ProduceBatchRequest, ProduceRequest, ProtocolError, Request, Response,
+        decode_request, decode_response, encode_request, encode_response,
     };
 
     fn produce_request() -> Request {
@@ -1003,6 +1237,50 @@ mod tests {
             Some(request)
         );
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn round_trips_zstd_produce_batch_and_ack() {
+        let request = Request::ProduceBatch(
+            ProduceBatchRequest::new(
+                "payments".to_owned(),
+                vec![
+                    BatchRecord {
+                        key: Bytes::from_static(b"customer-1"),
+                        payload: Bytes::from_static(b"hello hello hello"),
+                    },
+                    BatchRecord {
+                        key: Bytes::new(),
+                        payload: Bytes::from_static(b"world world world"),
+                    },
+                ],
+                AckMode::Durable,
+                Compression::Zstd,
+            )
+            .expect("batch should be valid"),
+        );
+        let mut encoded = BytesMut::new();
+        encode_request(&request, &mut encoded).expect("batch should encode");
+        assert_eq!(
+            decode_request(&mut encoded).expect("batch should decode"),
+            Some(request)
+        );
+
+        let response = Response::ProduceBatchAck(vec![
+            super::ProduceAck {
+                partition: 1,
+                offset: 7,
+            },
+            super::ProduceAck {
+                partition: 2,
+                offset: 4,
+            },
+        ]);
+        encode_response(&response, &mut encoded).expect("batch ack should encode");
+        assert_eq!(
+            decode_response(&mut encoded).expect("batch ack should decode"),
+            Some(response)
+        );
     }
 
     #[test]

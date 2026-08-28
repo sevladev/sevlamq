@@ -4,7 +4,8 @@ use bytes::{Bytes, BytesMut};
 use sevlamq_protocol::{
     AckMode, CommitOffsetRequest, FetchCommittedOffsetRequest, FetchRequest, FetchResponse,
     GroupFetchRequest, GroupGenerationRequest, GroupMemberRequest, JoinGroupResponse, ProduceAck,
-    ProduceRequest, ProducerIdentity, Request, Response, decode_response, encode_request,
+    ProduceBatchRequest, ProduceRequest, ProducerIdentity, Request, Response, decode_response,
+    encode_request,
 };
 use thiserror::Error;
 use tokio::{
@@ -41,6 +42,16 @@ impl Client {
         )?);
         match self.request(request).await? {
             Response::ProduceAck(ack) => Ok(ack),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn produce_batch(
+        &mut self,
+        request: ProduceBatchRequest,
+    ) -> Result<Vec<ProduceAck>, ClientError> {
+        match self.request(Request::ProduceBatch(request)).await? {
+            Response::ProduceBatchAck(acks) => Ok(acks),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

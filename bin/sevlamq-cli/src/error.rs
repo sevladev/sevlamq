@@ -4,6 +4,8 @@ use thiserror::Error;
 pub enum CliError {
     #[error(transparent)]
     Client(#[from] sevlamq_client::ClientError),
+    #[error(transparent)]
+    Protocol(#[from] sevlamq_protocol::ProtocolError),
     #[error("record offset space is exhausted")]
     OffsetOverflow,
     #[error("retry attempt space is exhausted")]

@@ -70,6 +70,25 @@ async fn execute_single(broker: std::net::SocketAddr, command: Command) -> Resul
             )
             .await
         }
+        Command::ProduceBatch {
+            topic,
+            message,
+            key,
+            acks,
+            compression,
+        } => {
+            produce::execute_batch(
+                &mut client,
+                produce::BatchOptions {
+                    topic,
+                    messages: message,
+                    key,
+                    acks,
+                    compression,
+                },
+            )
+            .await
+        }
         Command::Fetch {
             topic,
             partition,
