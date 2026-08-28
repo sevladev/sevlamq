@@ -4,15 +4,69 @@ use thiserror::Error;
 pub const MAX_TOPIC_NAME: usize = 249;
 pub const MAX_KEY_SIZE: usize = u16::MAX as usize;
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
-pub const MAX_FRAME_SIZE: usize = 1 + 2 + MAX_TOPIC_NAME + 2 + MAX_KEY_SIZE + 4 + MAX_MESSAGE_SIZE;
+pub const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
+pub const MAX_FETCH_BYTES: usize = 3 * 1024 * 1024;
 
 const FRAME_HEADER_SIZE: usize = size_of::<u32>();
 const PRODUCE: u8 = 0x01;
 const PRODUCE_ACK: u8 = 0x02;
+const FETCH: u8 = 0x10;
+const FETCH_RESPONSE: u8 = 0x11;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Produce(ProduceRequest),
+    Fetch(FetchRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchRequest {
+    topic: String,
+    partition: u32,
+    offset: u64,
+    max_bytes: u32,
+}
+
+impl FetchRequest {
+    pub fn new(
+        topic: String,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<Self, ProtocolError> {
+        validate_topic(&topic)?;
+        let max_bytes_usize =
+            usize::try_from(max_bytes).map_err(|_| ProtocolError::FetchTooLarge)?;
+        if max_bytes == 0 || max_bytes_usize > MAX_FETCH_BYTES {
+            return Err(ProtocolError::FetchTooLarge);
+        }
+        Ok(Self {
+            topic,
+            partition,
+            offset,
+            max_bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    #[must_use]
+    pub const fn partition(&self) -> u32 {
+        self.partition
+    }
+
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn max_bytes(&self) -> u32 {
+        self.max_bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,15 +108,41 @@ impl ProduceRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     ProduceAck(ProduceAck),
+    Fetch(FetchResponse),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProduceAck {
     pub partition: u32,
     pub offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchResponse {
+    records: Vec<FetchedRecord>,
+}
+
+impl FetchResponse {
+    #[must_use]
+    pub const fn new(records: Vec<FetchedRecord>) -> Self {
+        Self { records }
+    }
+
+    #[must_use]
+    pub fn records(&self) -> &[FetchedRecord] {
+        &self.records
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedRecord {
+    pub offset: u64,
+    pub timestamp_ms: u64,
+    pub key: Option<Bytes>,
+    pub value: Bytes,
 }
 
 pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, ProtocolError> {
@@ -93,6 +173,7 @@ pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, Protocol
 
     match opcode {
         PRODUCE => decode_produce(frame).map(|request| Some(Request::Produce(request))),
+        FETCH => decode_fetch(frame).map(|request| Some(Request::Fetch(request))),
         value => Err(ProtocolError::UnknownOpcode(value)),
     }
 }
@@ -100,17 +181,20 @@ pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, Protocol
 pub fn encode_request(request: &Request, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
     match request {
         Request::Produce(request) => encode_produce(request, buffer),
+        Request::Fetch(request) => encode_fetch(request, buffer),
     }
 }
 
-pub fn encode_response(response: Response, buffer: &mut BytesMut) {
+pub fn encode_response(response: &Response, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
     match response {
         Response::ProduceAck(ack) => {
             buffer.put_u32(1 + 4 + 8);
             buffer.put_u8(PRODUCE_ACK);
             buffer.put_u32(ack.partition);
             buffer.put_u64(ack.offset);
+            Ok(())
         }
+        Response::Fetch(response) => encode_fetch_response(response, buffer),
     }
 }
 
@@ -149,6 +233,9 @@ pub fn decode_response(buffer: &mut BytesMut) -> Result<Option<Response>, Protoc
                 offset: frame.get_u64(),
             })))
         }
+        FETCH_RESPONSE => {
+            decode_fetch_response(frame).map(|response| Some(Response::Fetch(response)))
+        }
         value => Err(ProtocolError::UnknownOpcode(value)),
     }
 }
@@ -181,6 +268,24 @@ fn decode_produce(mut frame: BytesMut) -> Result<ProduceRequest, ProtocolError> 
     ProduceRequest::new(topic, key, payload)
 }
 
+fn decode_fetch(mut frame: BytesMut) -> Result<FetchRequest, ProtocolError> {
+    let topic_len = read_u16_len(&mut frame)?;
+    validate_size(topic_len, MAX_TOPIC_NAME, ProtocolError::TopicTooLarge)?;
+    let topic = read_bytes(&mut frame, topic_len)?;
+    let topic = String::from_utf8(topic.to_vec()).map_err(|_| ProtocolError::InvalidTopic)?;
+    ensure_remaining(
+        &frame,
+        size_of::<u32>() + size_of::<u64>() + size_of::<u32>(),
+    )?;
+    let partition = frame.get_u32();
+    let offset = frame.get_u64();
+    let max_bytes = frame.get_u32();
+    if frame.has_remaining() {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    FetchRequest::new(topic, partition, offset, max_bytes)
+}
+
 fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
     let frame_len = 1 + 2 + request.topic.len() + 2 + request.key.len() + 4 + request.payload.len();
     buffer.put_u32(u32::try_from(frame_len).map_err(|_| ProtocolError::FrameTooLarge)?);
@@ -193,6 +298,94 @@ fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(),
         .put_u32(u32::try_from(request.payload.len()).map_err(|_| ProtocolError::MessageTooLarge)?);
     buffer.extend_from_slice(&request.payload);
     Ok(())
+}
+
+fn encode_fetch(request: &FetchRequest, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
+    let frame_len = 1 + 2 + request.topic.len() + 4 + 8 + 4;
+    buffer.put_u32(u32::try_from(frame_len).map_err(|_| ProtocolError::FrameTooLarge)?);
+    buffer.put_u8(FETCH);
+    buffer.put_u16(u16::try_from(request.topic.len()).map_err(|_| ProtocolError::TopicTooLarge)?);
+    buffer.extend_from_slice(request.topic.as_bytes());
+    buffer.put_u32(request.partition);
+    buffer.put_u64(request.offset);
+    buffer.put_u32(request.max_bytes);
+    Ok(())
+}
+
+fn encode_fetch_response(
+    response: &FetchResponse,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    let frame_start = buffer.len();
+    buffer.put_u32(0);
+    buffer.put_u8(FETCH_RESPONSE);
+    buffer
+        .put_u32(u32::try_from(response.records.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
+    for record in &response.records {
+        buffer.put_u64(record.offset);
+        buffer.put_u64(record.timestamp_ms);
+        match &record.key {
+            Some(key) => {
+                buffer.put_i32(i32::try_from(key.len()).map_err(|_| ProtocolError::KeyTooLarge)?);
+            }
+            None => buffer.put_i32(-1),
+        }
+        buffer.put_u32(
+            u32::try_from(record.value.len()).map_err(|_| ProtocolError::MessageTooLarge)?,
+        );
+        if let Some(key) = &record.key {
+            buffer.extend_from_slice(key);
+        }
+        buffer.extend_from_slice(&record.value);
+    }
+
+    let frame_len = buffer.len() - frame_start - FRAME_HEADER_SIZE;
+    if frame_len > MAX_FRAME_SIZE {
+        buffer.truncate(frame_start);
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    let encoded_len = u32::try_from(frame_len).map_err(|_| ProtocolError::FrameTooLarge)?;
+    buffer[frame_start..frame_start + FRAME_HEADER_SIZE]
+        .copy_from_slice(&encoded_len.to_be_bytes());
+    Ok(())
+}
+
+fn decode_fetch_response(mut frame: BytesMut) -> Result<FetchResponse, ProtocolError> {
+    ensure_remaining(&frame, size_of::<u32>())?;
+    let record_count =
+        usize::try_from(frame.get_u32()).map_err(|_| ProtocolError::FrameTooLarge)?;
+    let mut records = Vec::with_capacity(record_count.min(1024));
+
+    for _ in 0..record_count {
+        ensure_remaining(
+            &frame,
+            size_of::<u64>() * 2 + size_of::<i32>() + size_of::<u32>(),
+        )?;
+        let offset = frame.get_u64();
+        let timestamp_ms = frame.get_u64();
+        let key_len = frame.get_i32();
+        let value_len =
+            usize::try_from(frame.get_u32()).map_err(|_| ProtocolError::FrameTooLarge)?;
+        let key = match key_len {
+            -1 => None,
+            0.. => {
+                let len = usize::try_from(key_len).map_err(|_| ProtocolError::InvalidFrame)?;
+                Some(read_bytes(&mut frame, len)?)
+            }
+            _ => return Err(ProtocolError::InvalidFrame),
+        };
+        let value = read_bytes(&mut frame, value_len)?;
+        records.push(FetchedRecord {
+            offset,
+            timestamp_ms,
+            key,
+            value,
+        });
+    }
+    if frame.has_remaining() {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    Ok(FetchResponse::new(records))
 }
 
 fn validate_topic(topic: &str) -> Result<(), ProtocolError> {
@@ -252,6 +445,8 @@ pub enum ProtocolError {
     KeyTooLarge,
     #[error("message exceeds the configured limit")]
     MessageTooLarge,
+    #[error("fetch byte limit is zero or exceeds the configured limit")]
+    FetchTooLarge,
 }
 
 #[cfg(test)]
@@ -260,7 +455,8 @@ mod tests {
     use bytes::{BufMut, Bytes, BytesMut};
 
     use super::{
-        MAX_FRAME_SIZE, ProduceRequest, ProtocolError, Request, decode_request, encode_request,
+        FetchRequest, FetchResponse, FetchedRecord, MAX_FRAME_SIZE, ProduceRequest, ProtocolError,
+        Request, Response, decode_request, decode_response, encode_request, encode_response,
     };
 
     fn produce_request() -> Request {
@@ -330,6 +526,37 @@ mod tests {
         assert_eq!(
             decode_request(&mut buffer),
             Err(ProtocolError::FrameTooLarge)
+        );
+    }
+
+    #[test]
+    fn round_trips_fetch_request() {
+        let request = Request::Fetch(
+            FetchRequest::new("payments".to_owned(), 0, 42, 4096).expect("fetch should be valid"),
+        );
+        let mut buffer = BytesMut::new();
+        encode_request(&request, &mut buffer).expect("request should encode");
+
+        assert_eq!(
+            decode_request(&mut buffer).expect("request should decode"),
+            Some(request)
+        );
+    }
+
+    #[test]
+    fn round_trips_fetch_response() {
+        let response = Response::Fetch(FetchResponse::new(vec![FetchedRecord {
+            offset: 42,
+            timestamp_ms: 1_700_000_000_000,
+            key: Some(Bytes::from_static(b"customer-123")),
+            value: Bytes::from_static(b"hello"),
+        }]));
+        let mut buffer = BytesMut::new();
+        encode_response(&response, &mut buffer).expect("response should encode");
+
+        assert_eq!(
+            decode_response(&mut buffer).expect("response should decode"),
+            Some(response)
         );
     }
 }

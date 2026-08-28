@@ -137,6 +137,33 @@ impl PartitionLog {
         Ok(())
     }
 
+    pub fn read(&self, offset: u64, max_bytes: usize) -> Result<Vec<StoredRecord>, StorageError> {
+        if max_bytes == 0 {
+            return Err(StorageError::InvalidReadLimit);
+        }
+
+        let contents = fs::read(&self.active_path)?;
+        let mut buffer = BytesMut::from(contents.as_slice());
+        let mut records = Vec::new();
+        let mut bytes_read = 0_usize;
+
+        while !buffer.is_empty() {
+            let before = buffer.len();
+            let record = decode_record(&mut buffer)?.ok_or(StorageError::InvalidRecord)?;
+            let encoded_size = before - buffer.len();
+            if record.offset() < offset {
+                continue;
+            }
+            if !records.is_empty() && bytes_read + encoded_size > max_bytes {
+                break;
+            }
+            bytes_read += encoded_size;
+            records.push(record);
+        }
+
+        Ok(records)
+    }
+
     #[must_use]
     pub fn active_path(&self) -> &Path {
         &self.active_path
@@ -316,6 +343,10 @@ pub enum StorageError {
     MultipleSegmentsNotSupported,
     #[error("record timestamp is outside the supported range")]
     InvalidTimestamp,
+    #[error("read limit must be greater than zero")]
+    InvalidReadLimit,
+    #[error("partition {0} does not exist")]
+    UnknownPartition(u32),
 }
 
 #[cfg(test)]
@@ -450,5 +481,29 @@ mod tests {
                 .len(),
             valid_len
         );
+    }
+
+    #[test]
+    fn reads_records_from_requested_offset() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let mut log = PartitionLog::create(data_dir.path(), "payments", 0)
+            .expect("partition log should be created");
+        for value in ["zero", "one", "two"] {
+            log.append(&Record::new(
+                None,
+                Bytes::copy_from_slice(value.as_bytes()),
+                1,
+            ))
+            .expect("append should work");
+        }
+        log.flush().expect("log should flush");
+
+        let records = log.read(1, 1024).expect("read should work");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].offset(), 1);
+        assert_eq!(records[0].value(), &Bytes::from_static(b"one"));
+        assert_eq!(records[1].offset(), 2);
+        assert_eq!(records[1].value(), &Bytes::from_static(b"two"));
     }
 }

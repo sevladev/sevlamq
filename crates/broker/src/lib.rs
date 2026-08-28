@@ -8,7 +8,9 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use sevlamq_common::BrokerConfig;
-use sevlamq_protocol::{ProduceAck, Request, Response, decode_request, encode_response};
+use sevlamq_protocol::{
+    FetchResponse, FetchedRecord, ProduceAck, Request, Response, decode_request, encode_response,
+};
 use sevlamq_storage::{PartitionLog, Record};
 use thiserror::Error;
 use tokio::{
@@ -105,12 +107,37 @@ async fn handle_connection(
                         )
                         .await?;
                     encode_response(
-                        Response::ProduceAck(ProduceAck {
+                        &Response::ProduceAck(ProduceAck {
                             partition: 0,
                             offset,
                         }),
                         &mut write_buffer,
+                    )?;
+                    stream.write_all(&write_buffer).await?;
+                    write_buffer.clear();
+                }
+                Request::Fetch(request) => {
+                    debug!(
+                        connection_id,
+                        %peer,
+                        topic = %request.topic(),
+                        partition = request.partition(),
+                        offset = request.offset(),
+                        max_bytes = request.max_bytes(),
+                        "fetch received"
                     );
+                    let records = storage
+                        .read(
+                            request.topic().to_owned(),
+                            request.partition(),
+                            request.offset(),
+                            request.max_bytes(),
+                        )
+                        .await?;
+                    encode_response(
+                        &Response::Fetch(FetchResponse::new(records)),
+                        &mut write_buffer,
+                    )?;
                     stream.write_all(&write_buffer).await?;
                     write_buffer.clear();
                 }
@@ -149,6 +176,30 @@ impl StorageHandle {
             .map_err(|_| ConnectionError::StorageUnavailable)?
             .map_err(ConnectionError::Storage)
     }
+
+    async fn read(
+        &self,
+        topic: String,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<Vec<FetchedRecord>, ConnectionError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::Read {
+                topic,
+                partition,
+                offset,
+                max_bytes,
+                reply,
+            })
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        response
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?
+            .map_err(ConnectionError::Storage)
+    }
 }
 
 enum StorageCommand {
@@ -157,6 +208,13 @@ enum StorageCommand {
         key: Bytes,
         value: Bytes,
         reply: oneshot::Sender<Result<u64, sevlamq_storage::StorageError>>,
+    },
+    Read {
+        topic: String,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
+        reply: oneshot::Sender<Result<Vec<FetchedRecord>, sevlamq_storage::StorageError>>,
     },
 }
 
@@ -178,6 +236,17 @@ fn start_storage_worker(
                     reply,
                 } => {
                     let result = append_record(&data_dir, &mut logs, &topic, key, value);
+                    let _ = reply.send(result);
+                }
+                StorageCommand::Read {
+                    topic,
+                    partition,
+                    offset,
+                    max_bytes,
+                    reply,
+                } => {
+                    let result =
+                        read_records(&data_dir, &mut logs, &topic, partition, offset, max_bytes);
                     let _ = reply.send(result);
                 }
             }
@@ -209,6 +278,38 @@ fn append_record(
     .map_err(|_| sevlamq_storage::StorageError::InvalidTimestamp)?;
     let key = (!key.is_empty()).then_some(key);
     log.append(&Record::new(key, value, timestamp_ms))
+}
+
+fn read_records(
+    data_dir: &Path,
+    logs: &mut HashMap<String, PartitionLog>,
+    topic: &str,
+    partition: u32,
+    offset: u64,
+    max_bytes: u32,
+) -> Result<Vec<FetchedRecord>, sevlamq_storage::StorageError> {
+    if partition != 0 {
+        return Err(sevlamq_storage::StorageError::UnknownPartition(partition));
+    }
+    if !logs.contains_key(topic) {
+        logs.insert(topic.to_owned(), PartitionLog::open(data_dir, topic, 0)?);
+    }
+    let log = logs
+        .get(topic)
+        .ok_or(sevlamq_storage::StorageError::InvalidTopic)?;
+    let max_bytes =
+        usize::try_from(max_bytes).map_err(|_| sevlamq_storage::StorageError::InvalidReadLimit)?;
+    log.read(offset, max_bytes).map(|records| {
+        records
+            .into_iter()
+            .map(|record| FetchedRecord {
+                offset: record.offset(),
+                timestamp_ms: record.timestamp_ms(),
+                key: record.key().cloned(),
+                value: record.value().clone(),
+            })
+            .collect()
+    })
 }
 
 fn report_connection_result(result: Result<Result<(), ConnectionError>, tokio::task::JoinError>) {
@@ -263,7 +364,7 @@ mod tests {
     use super::{handle_connection, start_storage_worker};
 
     #[tokio::test]
-    async fn acknowledges_a_produce_request() {
+    async fn produces_and_fetches_persisted_records() {
         timeout(Duration::from_secs(2), async {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -282,16 +383,31 @@ mod tests {
             let mut client = Client::connect(address)
                 .await
                 .expect("client should connect");
-            let ack = client
-                .produce(
-                    "payments".to_owned(),
-                    Bytes::from_static(b"customer-123"),
-                    Bytes::from_static(br#"{"amount":150}"#),
-                )
+            for (expected_offset, value) in ["zero", "one", "two"].into_iter().enumerate() {
+                let ack = client
+                    .produce(
+                        "payments".to_owned(),
+                        Bytes::from_static(b"customer-123"),
+                        Bytes::copy_from_slice(value.as_bytes()),
+                    )
+                    .await
+                    .expect("broker should acknowledge produce");
+                assert_eq!(ack.partition, 0);
+                assert_eq!(
+                    ack.offset,
+                    u64::try_from(expected_offset).expect("offset should fit in u64")
+                );
+            }
+
+            let response = client
+                .fetch("payments".to_owned(), 0, 1, 1024)
                 .await
-                .expect("broker should acknowledge produce");
-            assert_eq!(ack.partition, 0);
-            assert_eq!(ack.offset, 0);
+                .expect("broker should return records");
+            assert_eq!(response.records().len(), 2);
+            assert_eq!(response.records()[0].offset, 1);
+            assert_eq!(response.records()[0].value, Bytes::from_static(b"one"));
+            assert_eq!(response.records()[1].offset, 2);
+            assert_eq!(response.records()[1].value, Bytes::from_static(b"two"));
 
             drop(client);
             server
