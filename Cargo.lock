@@ -388,6 +388,7 @@ dependencies = [
  "bytes",
  "clap",
  "sevlamq-client",
+ "sevlamq-protocol",
  "thiserror",
  "tokio",
 ]

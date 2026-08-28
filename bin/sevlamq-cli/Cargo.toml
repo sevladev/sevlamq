@@ -14,6 +14,7 @@ path = "src/main.rs"
 bytes.workspace = true
 clap.workspace = true
 sevlamq-client = { path = "../../crates/client" }
+sevlamq-protocol = { path = "../../crates/protocol" }
 thiserror.workspace = true
 tokio.workspace = true
 

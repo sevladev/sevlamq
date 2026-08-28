@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -12,7 +12,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use sevlamq_common::BrokerConfig;
 use sevlamq_protocol::{
-    FetchResponse, FetchedRecord, ProduceAck, Request, Response, decode_request, encode_response,
+    FetchResponse, FetchedRecord, GroupFetchRequest, ProduceAck, Request, Response, decode_request,
+    encode_response,
 };
 use sevlamq_storage::{PartitionLog, Record, discover_partitions};
 use thiserror::Error;
@@ -24,6 +25,10 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 use tracing::{debug, info, warn};
+
+mod groups;
+
+use groups::{GroupCoordinator, GroupIdentity};
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 const STORAGE_QUEUE_CAPACITY: usize = 1024;
@@ -38,9 +43,14 @@ pub async fn run(config: &BrokerConfig) -> Result<(), BrokerError> {
     )
     .await?;
     let listener = TcpListener::bind(address).await?;
+    let groups = GroupHandle::open(
+        Path::new(&config.data_dir),
+        config.default_partition_count,
+        Duration::from_millis(config.group_session_timeout_ms),
+    )?;
 
     info!(%address, data_dir = %config.data_dir, "broker started");
-    accept_connections(&listener, storage.clone()).await?;
+    accept_connections(&listener, storage.clone(), groups).await?;
     info!("shutdown signal received");
 
     drop(storage);
@@ -53,6 +63,7 @@ pub async fn run(config: &BrokerConfig) -> Result<(), BrokerError> {
 async fn accept_connections(
     listener: &TcpListener,
     storage: StorageHandle,
+    groups: GroupHandle,
 ) -> Result<(), BrokerError> {
     let mut connections = JoinSet::new();
 
@@ -65,7 +76,7 @@ async fn accept_connections(
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
                 let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-                connections.spawn(handle_connection(stream, peer, connection_id, storage.clone()));
+                connections.spawn(handle_connection(stream, peer, connection_id, storage.clone(), groups.clone()));
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 report_connection_result(result);
@@ -85,6 +96,7 @@ async fn handle_connection(
     peer: SocketAddr,
     connection_id: u64,
     storage: StorageHandle,
+    groups: GroupHandle,
 ) -> Result<(), ConnectionError> {
     let mut read_buffer = BytesMut::with_capacity(8 * 1024);
     let mut write_buffer = BytesMut::with_capacity(128);
@@ -154,12 +166,166 @@ async fn handle_connection(
                     stream.write_all(&write_buffer).await?;
                     write_buffer.clear();
                 }
+                Request::GroupFetch(request) => {
+                    let response = group_fetch(&storage, &groups, request).await?;
+                    encode_response(&response, &mut write_buffer)?;
+                    stream.write_all(&write_buffer).await?;
+                    write_buffer.clear();
+                }
+                request @ (Request::JoinGroup(_)
+                | Request::Heartbeat(_)
+                | Request::LeaveGroup(_)
+                | Request::CommitOffset(_)
+                | Request::FetchCommittedOffset(_)) => {
+                    let response = groups.execute(request).await;
+                    encode_response(&response, &mut write_buffer)?;
+                    stream.write_all(&write_buffer).await?;
+                    write_buffer.clear();
+                }
             }
         }
     }
 
     debug!(connection_id, %peer, "connection closed");
     Ok(())
+}
+
+async fn group_fetch(
+    storage: &StorageHandle,
+    groups: &GroupHandle,
+    request: GroupFetchRequest,
+) -> Result<Response, ConnectionError> {
+    match groups.execute(Request::GroupFetch(request.clone())).await {
+        Response::GroupAck => storage
+            .read(
+                request.topic,
+                request.partition,
+                request.offset,
+                request.max_bytes,
+                request.max_wait_ms,
+            )
+            .await
+            .map(|records| Response::Fetch(FetchResponse::new(records))),
+        error @ Response::Error(_) => Ok(error),
+        _ => Ok(Response::Error(
+            "invalid group authorization response".to_owned(),
+        )),
+    }
+}
+
+#[derive(Clone)]
+struct GroupHandle {
+    coordinator: Arc<std::sync::Mutex<GroupCoordinator>>,
+}
+
+impl GroupHandle {
+    fn open(
+        data_dir: &Path,
+        partition_count: u32,
+        session_timeout: Duration,
+    ) -> Result<Self, BrokerError> {
+        let coordinator = Arc::new(std::sync::Mutex::new(GroupCoordinator::open(
+            data_dir,
+            partition_count,
+            session_timeout,
+        )?));
+        start_group_session_sweeper(&coordinator);
+        Ok(Self { coordinator })
+    }
+
+    async fn execute(&self, request: Request) -> Response {
+        let coordinator = Arc::clone(&self.coordinator);
+        match tokio::task::spawn_blocking(move || execute_group_request(&coordinator, request))
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => Response::Error(error.to_string()),
+            Err(error) => Response::Error(format!("group coordinator task failed: {error}")),
+        }
+    }
+}
+
+fn start_group_session_sweeper(coordinator: &Arc<std::sync::Mutex<GroupCoordinator>>) {
+    let coordinator = Arc::downgrade(coordinator);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(coordinator) = coordinator.upgrade() else {
+                break;
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                coordinator
+                    .lock()
+                    .map_err(|_| groups::GroupError::CoordinatorPoisoned)?
+                    .expire_sessions()
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "consumer group session sweep failed"),
+                Err(error) => warn!(%error, "consumer group session sweep task failed"),
+            }
+        }
+    });
+}
+
+fn execute_group_request(
+    coordinator: &std::sync::Mutex<GroupCoordinator>,
+    request: Request,
+) -> Result<Response, groups::GroupError> {
+    let mut coordinator = coordinator
+        .lock()
+        .map_err(|_| groups::GroupError::CoordinatorPoisoned)?;
+    match request {
+        Request::JoinGroup(request) => coordinator
+            .join(&request.group, &request.topic, &request.member)
+            .map(Response::JoinGroup),
+        Request::Heartbeat(request) => coordinator
+            .heartbeat(
+                &request.group,
+                &request.topic,
+                &request.member,
+                request.generation,
+            )
+            .map(|()| Response::GroupAck),
+        Request::LeaveGroup(request) => coordinator
+            .leave(
+                &request.group,
+                &request.topic,
+                &request.member,
+                request.generation,
+            )
+            .map(|()| Response::GroupAck),
+        Request::CommitOffset(request) => coordinator
+            .commit(
+                &GroupIdentity {
+                    group: &request.group,
+                    topic: &request.topic,
+                    member: &request.member,
+                    generation: request.generation,
+                },
+                request.partition,
+                request.offset,
+            )
+            .map(|()| Response::GroupAck),
+        Request::FetchCommittedOffset(request) => coordinator
+            .committed_offset(&request.group, &request.topic, request.partition)
+            .map(Response::CommittedOffset),
+        Request::GroupFetch(request) => coordinator
+            .authorize_fetch(
+                &GroupIdentity {
+                    group: &request.group,
+                    topic: &request.topic,
+                    member: &request.member,
+                    generation: request.generation,
+                },
+                request.partition,
+            )
+            .map(|()| Response::GroupAck),
+        Request::Produce(_) | Request::Fetch(_) => unreachable!("group requests are filtered"),
+    }
 }
 
 #[derive(Clone)]
@@ -495,6 +661,8 @@ pub enum BrokerError {
     Storage(#[from] sevlamq_storage::StorageError),
     #[error("storage worker failed: {0}")]
     StorageWorker(#[from] tokio::task::JoinError),
+    #[error(transparent)]
+    Group(#[from] groups::GroupError),
     #[error("default partition count must be greater than zero")]
     InvalidPartitionCount,
     #[error(
@@ -532,7 +700,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::{net::TcpListener, time::timeout};
 
-    use super::{handle_connection, select_partition, start_storage_worker};
+    use super::{GroupHandle, handle_connection, select_partition, start_storage_worker};
 
     #[test]
     fn selects_partitions_deterministically_and_round_robins_unkeyed_messages() {
@@ -632,9 +800,11 @@ mod tests {
                     .await
                     .expect("storage worker should start");
             let connection_storage = storage.clone();
+            let groups = GroupHandle::open(data_dir.path(), 3, Duration::from_secs(10))
+                .expect("group coordinator should start");
             let server = tokio::spawn(async move {
                 let (stream, peer) = listener.accept().await.expect("connection should arrive");
-                handle_connection(stream, peer, 1, connection_storage).await
+                handle_connection(stream, peer, 1, connection_storage, groups).await
             });
 
             let mut client = Client::connect(address)

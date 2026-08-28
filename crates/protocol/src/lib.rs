@@ -13,11 +13,71 @@ const PRODUCE: u8 = 0x01;
 const PRODUCE_ACK: u8 = 0x02;
 const FETCH: u8 = 0x10;
 const FETCH_RESPONSE: u8 = 0x11;
+const JOIN_GROUP: u8 = 0x20;
+const JOIN_GROUP_RESPONSE: u8 = 0x21;
+const HEARTBEAT: u8 = 0x22;
+const LEAVE_GROUP: u8 = 0x23;
+const COMMIT_OFFSET: u8 = 0x24;
+const FETCH_COMMITTED_OFFSET: u8 = 0x25;
+const GROUP_ACK: u8 = 0x26;
+const COMMITTED_OFFSET_RESPONSE: u8 = 0x27;
+const ERROR_RESPONSE: u8 = 0x7f;
+const GROUP_FETCH: u8 = 0x28;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Produce(ProduceRequest),
     Fetch(FetchRequest),
+    JoinGroup(GroupMemberRequest),
+    Heartbeat(GroupGenerationRequest),
+    LeaveGroup(GroupGenerationRequest),
+    CommitOffset(CommitOffsetRequest),
+    FetchCommittedOffset(FetchCommittedOffsetRequest),
+    GroupFetch(GroupFetchRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMemberRequest {
+    pub group: String,
+    pub topic: String,
+    pub member: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupGenerationRequest {
+    pub group: String,
+    pub topic: String,
+    pub member: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitOffsetRequest {
+    pub group: String,
+    pub topic: String,
+    pub member: String,
+    pub generation: u64,
+    pub partition: u32,
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchCommittedOffsetRequest {
+    pub group: String,
+    pub topic: String,
+    pub partition: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupFetchRequest {
+    pub group: String,
+    pub topic: String,
+    pub member: String,
+    pub generation: u64,
+    pub partition: u32,
+    pub offset: u64,
+    pub max_bytes: u32,
+    pub max_wait_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +184,36 @@ impl ProduceRequest {
 pub enum Response {
     ProduceAck(ProduceAck),
     Fetch(FetchResponse),
+    JoinGroup(JoinGroupResponse),
+    GroupAck,
+    CommittedOffset(Option<u64>),
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinGroupResponse {
+    generation: u64,
+    partitions: Vec<u32>,
+}
+
+impl JoinGroupResponse {
+    #[must_use]
+    pub const fn new(generation: u64, partitions: Vec<u32>) -> Self {
+        Self {
+            generation,
+            partitions,
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn partitions(&self) -> &[u32] {
+        &self.partitions
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +276,19 @@ pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, Protocol
     match opcode {
         PRODUCE => decode_produce(frame).map(|request| Some(Request::Produce(request))),
         FETCH => decode_fetch(frame).map(|request| Some(Request::Fetch(request))),
+        JOIN_GROUP => decode_group_member(frame).map(|request| Some(Request::JoinGroup(request))),
+        HEARTBEAT => {
+            decode_group_generation(frame).map(|request| Some(Request::Heartbeat(request)))
+        }
+        LEAVE_GROUP => {
+            decode_group_generation(frame).map(|request| Some(Request::LeaveGroup(request)))
+        }
+        COMMIT_OFFSET => {
+            decode_commit_offset(frame).map(|request| Some(Request::CommitOffset(request)))
+        }
+        FETCH_COMMITTED_OFFSET => decode_fetch_committed(frame)
+            .map(|request| Some(Request::FetchCommittedOffset(request))),
+        GROUP_FETCH => decode_group_fetch(frame).map(|request| Some(Request::GroupFetch(request))),
         value => Err(ProtocolError::UnknownOpcode(value)),
     }
 }
@@ -194,6 +297,12 @@ pub fn encode_request(request: &Request, buffer: &mut BytesMut) -> Result<(), Pr
     match request {
         Request::Produce(request) => encode_produce(request, buffer),
         Request::Fetch(request) => encode_fetch(request, buffer),
+        Request::JoinGroup(request) => encode_group_member(JOIN_GROUP, request, buffer),
+        Request::Heartbeat(request) => encode_group_generation(HEARTBEAT, request, buffer),
+        Request::LeaveGroup(request) => encode_group_generation(LEAVE_GROUP, request, buffer),
+        Request::CommitOffset(request) => encode_commit_offset(request, buffer),
+        Request::FetchCommittedOffset(request) => encode_fetch_committed(request, buffer),
+        Request::GroupFetch(request) => encode_group_fetch(request, buffer),
     }
 }
 
@@ -207,6 +316,38 @@ pub fn encode_response(response: &Response, buffer: &mut BytesMut) -> Result<(),
             Ok(())
         }
         Response::Fetch(response) => encode_fetch_response(response, buffer),
+        Response::JoinGroup(response) => {
+            buffer.put_u32(
+                1 + 8
+                    + 4
+                    + u32::try_from(response.partitions.len())
+                        .map_err(|_| ProtocolError::FrameTooLarge)?
+                        * 4,
+            );
+            buffer.put_u8(JOIN_GROUP_RESPONSE);
+            buffer.put_u64(response.generation);
+            buffer.put_u32(
+                u32::try_from(response.partitions.len())
+                    .map_err(|_| ProtocolError::FrameTooLarge)?,
+            );
+            for partition in &response.partitions {
+                buffer.put_u32(*partition);
+            }
+            Ok(())
+        }
+        Response::GroupAck => {
+            buffer.put_u32(1);
+            buffer.put_u8(GROUP_ACK);
+            Ok(())
+        }
+        Response::CommittedOffset(offset) => {
+            buffer.put_u32(1 + 1 + 8);
+            buffer.put_u8(COMMITTED_OFFSET_RESPONSE);
+            buffer.put_u8(u8::from(offset.is_some()));
+            buffer.put_u64(offset.unwrap_or_default());
+            Ok(())
+        }
+        Response::Error(message) => encode_string_response(ERROR_RESPONSE, message, buffer),
     }
 }
 
@@ -247,6 +388,40 @@ pub fn decode_response(buffer: &mut BytesMut) -> Result<Option<Response>, Protoc
         }
         FETCH_RESPONSE => {
             decode_fetch_response(frame).map(|response| Some(Response::Fetch(response)))
+        }
+        JOIN_GROUP_RESPONSE => {
+            ensure_remaining(&frame, 12)?;
+            let generation = frame.get_u64();
+            let count =
+                usize::try_from(frame.get_u32()).map_err(|_| ProtocolError::FrameTooLarge)?;
+            ensure_remaining(
+                &frame,
+                count.checked_mul(4).ok_or(ProtocolError::FrameTooLarge)?,
+            )?;
+            let partitions = (0..count).map(|_| frame.get_u32()).collect();
+            if frame.has_remaining() {
+                return Err(ProtocolError::InvalidFrame);
+            }
+            Ok(Some(Response::JoinGroup(JoinGroupResponse::new(
+                generation, partitions,
+            ))))
+        }
+        GROUP_ACK if !frame.has_remaining() => Ok(Some(Response::GroupAck)),
+        COMMITTED_OFFSET_RESPONSE => {
+            ensure_remaining(&frame, 9)?;
+            let found = frame.get_u8();
+            let offset = frame.get_u64();
+            if frame.has_remaining() || found > 1 {
+                return Err(ProtocolError::InvalidFrame);
+            }
+            Ok(Some(Response::CommittedOffset(
+                (found == 1).then_some(offset),
+            )))
+        }
+        ERROR_RESPONSE => {
+            let message = decode_string(&mut frame)?;
+            ensure_empty(&frame)?;
+            Ok(Some(Response::Error(message)))
         }
         value => Err(ProtocolError::UnknownOpcode(value)),
     }
@@ -400,6 +575,226 @@ fn decode_fetch_response(mut frame: BytesMut) -> Result<FetchResponse, ProtocolE
         return Err(ProtocolError::InvalidFrame);
     }
     Ok(FetchResponse::new(records))
+}
+
+fn decode_group_member(mut frame: BytesMut) -> Result<GroupMemberRequest, ProtocolError> {
+    let group = decode_string(&mut frame)?;
+    let topic = decode_string(&mut frame)?;
+    let member = decode_string(&mut frame)?;
+    ensure_empty(&frame)?;
+    Ok(GroupMemberRequest {
+        group,
+        topic,
+        member,
+    })
+}
+
+fn decode_group_generation(mut frame: BytesMut) -> Result<GroupGenerationRequest, ProtocolError> {
+    let group = decode_string(&mut frame)?;
+    let topic = decode_string(&mut frame)?;
+    let member = decode_string(&mut frame)?;
+    ensure_remaining(&frame, 8)?;
+    let generation = frame.get_u64();
+    ensure_empty(&frame)?;
+    Ok(GroupGenerationRequest {
+        group,
+        topic,
+        member,
+        generation,
+    })
+}
+
+fn decode_commit_offset(mut frame: BytesMut) -> Result<CommitOffsetRequest, ProtocolError> {
+    let group = decode_string(&mut frame)?;
+    let topic = decode_string(&mut frame)?;
+    let member = decode_string(&mut frame)?;
+    ensure_remaining(&frame, 20)?;
+    let generation = frame.get_u64();
+    let partition = frame.get_u32();
+    let offset = frame.get_u64();
+    ensure_empty(&frame)?;
+    Ok(CommitOffsetRequest {
+        group,
+        topic,
+        member,
+        generation,
+        partition,
+        offset,
+    })
+}
+
+fn decode_fetch_committed(
+    mut frame: BytesMut,
+) -> Result<FetchCommittedOffsetRequest, ProtocolError> {
+    let group = decode_string(&mut frame)?;
+    let topic = decode_string(&mut frame)?;
+    ensure_remaining(&frame, 4)?;
+    let partition = frame.get_u32();
+    ensure_empty(&frame)?;
+    Ok(FetchCommittedOffsetRequest {
+        group,
+        topic,
+        partition,
+    })
+}
+
+fn decode_group_fetch(mut frame: BytesMut) -> Result<GroupFetchRequest, ProtocolError> {
+    let group = decode_string(&mut frame)?;
+    let topic = decode_string(&mut frame)?;
+    let member = decode_string(&mut frame)?;
+    ensure_remaining(&frame, 28)?;
+    let generation = frame.get_u64();
+    let partition = frame.get_u32();
+    let offset = frame.get_u64();
+    let max_bytes = frame.get_u32();
+    let max_wait_ms = frame.get_u32();
+    ensure_empty(&frame)?;
+    FetchRequest::new(topic.clone(), partition, offset, max_bytes, max_wait_ms)?;
+    Ok(GroupFetchRequest {
+        group,
+        topic,
+        member,
+        generation,
+        partition,
+        offset,
+        max_bytes,
+        max_wait_ms,
+    })
+}
+
+fn encode_group_member(
+    opcode: u8,
+    request: &GroupMemberRequest,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    encode_string_request(
+        opcode,
+        [&request.group, &request.topic, &request.member],
+        buffer,
+    )
+    .map(|_| ())
+}
+
+fn encode_group_generation(
+    opcode: u8,
+    request: &GroupGenerationRequest,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    let start = encode_string_request(
+        opcode,
+        [&request.group, &request.topic, &request.member],
+        buffer,
+    )?;
+    buffer.put_u64(request.generation);
+    set_frame_len(buffer, start)
+}
+
+fn encode_commit_offset(
+    request: &CommitOffsetRequest,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    let start = encode_string_request(
+        COMMIT_OFFSET,
+        [&request.group, &request.topic, &request.member],
+        buffer,
+    )?;
+    buffer.put_u64(request.generation);
+    buffer.put_u32(request.partition);
+    buffer.put_u64(request.offset);
+    set_frame_len(buffer, start)
+}
+
+fn encode_fetch_committed(
+    request: &FetchCommittedOffsetRequest,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    let start = encode_string_request(
+        FETCH_COMMITTED_OFFSET,
+        [&request.group, &request.topic],
+        buffer,
+    )?;
+    buffer.put_u32(request.partition);
+    set_frame_len(buffer, start)
+}
+
+fn encode_group_fetch(
+    request: &GroupFetchRequest,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    FetchRequest::new(
+        request.topic.clone(),
+        request.partition,
+        request.offset,
+        request.max_bytes,
+        request.max_wait_ms,
+    )?;
+    let start = encode_string_request(
+        GROUP_FETCH,
+        [&request.group, &request.topic, &request.member],
+        buffer,
+    )?;
+    buffer.put_u64(request.generation);
+    buffer.put_u32(request.partition);
+    buffer.put_u64(request.offset);
+    buffer.put_u32(request.max_bytes);
+    buffer.put_u32(request.max_wait_ms);
+    set_frame_len(buffer, start)
+}
+
+fn encode_string_request<const N: usize>(
+    opcode: u8,
+    values: [&String; N],
+    buffer: &mut BytesMut,
+) -> Result<usize, ProtocolError> {
+    let start = buffer.len();
+    buffer.put_u32(0);
+    buffer.put_u8(opcode);
+    for value in values {
+        encode_string(value, buffer)?;
+    }
+    set_frame_len(buffer, start)?;
+    Ok(start)
+}
+
+fn encode_string_response(
+    opcode: u8,
+    value: &str,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    let start = buffer.len();
+    buffer.put_u32(0);
+    buffer.put_u8(opcode);
+    encode_string(value, buffer)?;
+    set_frame_len(buffer, start)
+}
+
+fn encode_string(value: &str, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
+    buffer.put_u16(u16::try_from(value.len()).map_err(|_| ProtocolError::InvalidFrame)?);
+    buffer.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn decode_string(buffer: &mut BytesMut) -> Result<String, ProtocolError> {
+    let len = read_u16_len(buffer)?;
+    let bytes = read_bytes(buffer, len)?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| ProtocolError::InvalidFrame)
+}
+
+fn set_frame_len(buffer: &mut BytesMut, start: usize) -> Result<(), ProtocolError> {
+    let len = buffer.len() - start - FRAME_HEADER_SIZE;
+    buffer[start..start + FRAME_HEADER_SIZE].copy_from_slice(
+        &u32::try_from(len)
+            .map_err(|_| ProtocolError::FrameTooLarge)?
+            .to_be_bytes(),
+    );
+    Ok(())
+}
+
+fn ensure_empty(buffer: &BytesMut) -> Result<(), ProtocolError> {
+    if buffer.has_remaining() {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    Ok(())
 }
 
 fn validate_topic(topic: &str) -> Result<(), ProtocolError> {
@@ -573,6 +968,31 @@ mod tests {
 
         assert_eq!(
             decode_response(&mut buffer).expect("response should decode"),
+            Some(response)
+        );
+    }
+
+    #[test]
+    fn round_trips_consumer_group_frames() {
+        let request = Request::CommitOffset(super::CommitOffsetRequest {
+            group: "workers".to_owned(),
+            topic: "payments".to_owned(),
+            member: "worker-a".to_owned(),
+            generation: 7,
+            partition: 2,
+            offset: 42,
+        });
+        let mut buffer = BytesMut::new();
+        encode_request(&request, &mut buffer).expect("group request should encode");
+        assert_eq!(
+            decode_request(&mut buffer).expect("group request should decode"),
+            Some(request)
+        );
+
+        let response = Response::JoinGroup(super::JoinGroupResponse::new(7, vec![0, 2]));
+        encode_response(&response, &mut buffer).expect("group response should encode");
+        assert_eq!(
+            decode_response(&mut buffer).expect("group response should decode"),
             Some(response)
         );
     }
