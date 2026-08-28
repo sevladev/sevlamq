@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -16,6 +16,7 @@ const CRC_SIZE: usize = size_of::<u32>();
 const BODY_FIXED_SIZE: usize =
     size_of::<u8>() + size_of::<u64>() * 2 + size_of::<i32>() + size_of::<u32>();
 const MIN_RECORD_SIZE: usize = CRC_SIZE + BODY_FIXED_SIZE;
+const INDEX_ENTRY_SIZE: usize = size_of::<u64>() * 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
@@ -68,9 +69,11 @@ impl StoredRecord {
 pub struct PartitionLog {
     next_offset: u64,
     max_segment_bytes: u64,
+    index_interval_bytes: u64,
     partition_dir: PathBuf,
     segments: Vec<SegmentMetadata>,
     active_file: File,
+    active_index_file: File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +81,13 @@ pub struct SegmentMetadata {
     base_offset: u64,
     path: PathBuf,
     len: u64,
+    index: Vec<IndexEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexEntry {
+    offset: u64,
+    position: u64,
 }
 
 impl SegmentMetadata {
@@ -108,10 +118,14 @@ impl PartitionLog {
         topic: &str,
         partition: u32,
         max_segment_bytes: u64,
+        index_interval_bytes: u64,
     ) -> Result<Self, StorageError> {
         validate_topic(topic)?;
         if max_segment_bytes == 0 {
             return Err(StorageError::InvalidSegmentLimit);
+        }
+        if index_interval_bytes == 0 {
+            return Err(StorageError::InvalidIndexInterval);
         }
         let partition_dir = data_dir.as_ref().join(topic).join(partition.to_string());
         fs::create_dir_all(&partition_dir)?;
@@ -130,7 +144,8 @@ impl PartitionLog {
                 });
             }
             let is_active = index == last_index;
-            let (recovered_offset, valid_len) = recover_segment(&segment.path, next_offset)?;
+            let (recovered_offset, valid_len, recovered_index) =
+                recover_segment(&segment.path, next_offset, index_interval_bytes)?;
             if valid_len < segment.len {
                 if !is_active {
                     return Err(StorageError::IncompleteClosedSegment(segment.base_offset));
@@ -141,6 +156,8 @@ impl PartitionLog {
                     .set_len(valid_len)?;
                 segment.len = valid_len;
             }
+            segment.index = recovered_index;
+            rewrite_index(segment)?;
             next_offset = recovered_offset;
         }
 
@@ -149,13 +166,19 @@ impl PartitionLog {
             .read(true)
             .append(true)
             .open(active_path)?;
+        let active_index_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(index_path(active_path))?;
 
         Ok(Self {
             next_offset,
             max_segment_bytes,
+            index_interval_bytes,
             partition_dir,
             segments,
             active_file,
+            active_index_file,
         })
     }
 
@@ -171,6 +194,18 @@ impl PartitionLog {
             self.rotate()?;
         }
 
+        let active = self
+            .segments
+            .last()
+            .ok_or(StorageError::MissingActiveSegment)?;
+        let position = active.len;
+        let should_index = active.index.last().is_none_or(|entry| {
+            position.saturating_sub(entry.position) >= self.index_interval_bytes
+        });
+        if should_index {
+            self.active_index_file
+                .write_all(&encode_index_entry(offset, position))?;
+        }
         self.active_file.write_all(&encoded)?;
         let active = self
             .segments
@@ -180,6 +215,9 @@ impl PartitionLog {
             .len
             .checked_add(encoded_len)
             .ok_or(StorageError::RecordTooLarge)?;
+        if should_index {
+            active.index.push(IndexEntry { offset, position });
+        }
         self.next_offset = self
             .next_offset
             .checked_add(1)
@@ -189,6 +227,7 @@ impl PartitionLog {
 
     pub fn flush(&mut self) -> Result<(), StorageError> {
         self.active_file.flush()?;
+        self.active_index_file.flush()?;
         Ok(())
     }
 
@@ -208,7 +247,15 @@ impl PartitionLog {
             {
                 continue;
             }
-            let contents = fs::read(&segment.path)?;
+            let position = segment
+                .index
+                .partition_point(|entry| entry.offset <= offset)
+                .checked_sub(1)
+                .map_or(0, |index| segment.index[index].position);
+            let mut file = File::open(&segment.path)?;
+            file.seek(SeekFrom::Start(position))?;
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
             let mut buffer = BytesMut::from(contents.as_slice());
             while !buffer.is_empty() {
                 let before = buffer.len();
@@ -247,27 +294,47 @@ impl PartitionLog {
 
     fn rotate(&mut self) -> Result<(), StorageError> {
         self.active_file.flush()?;
+        self.active_index_file.flush()?;
         let segment = create_segment(&self.partition_dir, self.next_offset)?;
         self.active_file = OpenOptions::new()
             .read(true)
             .append(true)
             .open(&segment.path)?;
+        self.active_index_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(index_path(&segment.path))?;
         self.segments.push(segment);
         Ok(())
     }
 }
 
-fn recover_segment(path: &Path, mut next_offset: u64) -> Result<(u64, u64), StorageError> {
+fn recover_segment(
+    path: &Path,
+    mut next_offset: u64,
+    index_interval_bytes: u64,
+) -> Result<(u64, u64, Vec<IndexEntry>), StorageError> {
     let contents = fs::read(path)?;
     let total_len = contents.len();
     let mut buffer = BytesMut::from(contents.as_slice());
+    let mut index = Vec::new();
 
     loop {
+        let position =
+            u64::try_from(total_len - buffer.len()).map_err(|_| StorageError::RecordTooLarge)?;
         if let Some(record) = decode_record(&mut buffer)? {
             if record.offset() != next_offset {
                 return Err(StorageError::UnexpectedOffset {
                     expected: next_offset,
                     actual: record.offset(),
+                });
+            }
+            if index.last().is_none_or(|entry: &IndexEntry| {
+                position.saturating_sub(entry.position) >= index_interval_bytes
+            }) {
+                index.push(IndexEntry {
+                    offset: record.offset(),
+                    position,
                 });
             }
             next_offset = next_offset
@@ -278,6 +345,7 @@ fn recover_segment(path: &Path, mut next_offset: u64) -> Result<(u64, u64), Stor
             return Ok((
                 next_offset,
                 u64::try_from(valid_len).map_err(|_| StorageError::RecordTooLarge)?,
+                index,
             ));
         }
     }
@@ -305,6 +373,7 @@ fn discover_segments(partition_dir: &Path) -> Result<Vec<SegmentMetadata>, Stora
             base_offset,
             path,
             len,
+            index: Vec::new(),
         });
     }
     segments.sort_unstable_by_key(|segment| segment.base_offset);
@@ -317,11 +386,36 @@ fn create_segment(partition_dir: &Path, base_offset: u64) -> Result<SegmentMetad
         .write(true)
         .create_new(true)
         .open(&path)?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(index_path(&path))?;
     Ok(SegmentMetadata {
         base_offset,
         path,
         len: 0,
+        index: Vec::new(),
     })
+}
+
+fn index_path(log_path: &Path) -> PathBuf {
+    log_path.with_extension("idx")
+}
+
+fn rewrite_index(segment: &SegmentMetadata) -> Result<(), StorageError> {
+    let mut file = File::create(index_path(&segment.path))?;
+    for entry in &segment.index {
+        file.write_all(&encode_index_entry(entry.offset, entry.position))?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+fn encode_index_entry(offset: u64, position: u64) -> [u8; INDEX_ENTRY_SIZE] {
+    let mut encoded = [0_u8; INDEX_ENTRY_SIZE];
+    encoded[..size_of::<u64>()].copy_from_slice(&offset.to_be_bytes());
+    encoded[size_of::<u64>()..].copy_from_slice(&position.to_be_bytes());
+    encoded
 }
 
 pub fn decode_record(buffer: &mut BytesMut) -> Result<Option<StoredRecord>, StorageError> {
@@ -453,6 +547,8 @@ pub enum StorageError {
     UnexpectedOffset { expected: u64, actual: u64 },
     #[error("segment size limit must be greater than zero")]
     InvalidSegmentLimit,
+    #[error("index interval must be greater than zero")]
+    InvalidIndexInterval,
     #[error("partition has no active segment")]
     MissingActiveSegment,
     #[error("segment filename is invalid")]
@@ -480,12 +576,12 @@ mod tests {
     use bytes::{Bytes, BytesMut};
     use tempfile::tempdir;
 
-    use super::{PartitionLog, Record, decode_record};
+    use super::{INDEX_ENTRY_SIZE, PartitionLog, Record, decode_record};
 
     #[test]
     fn appends_records_with_monotonic_offsets() {
         let data_dir = tempdir().expect("temporary directory should be created");
-        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024)
+        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
             .expect("partition log should be created");
 
         let first = Record::new(
@@ -521,7 +617,7 @@ mod tests {
     #[test]
     fn detects_corrupted_record() {
         let data_dir = tempdir().expect("temporary directory should be created");
-        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024)
+        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
             .expect("partition log should be created");
         log.append(&Record::new(None, Bytes::from_static(b"hello"), 1))
             .expect("append should work");
@@ -541,7 +637,7 @@ mod tests {
     fn restores_next_offset_when_reopened() {
         let data_dir = tempdir().expect("temporary directory should be created");
         let path = {
-            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024)
+            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
                 .expect("partition log should be created");
             log.append(&Record::new(None, Bytes::from_static(b"first"), 1))
                 .expect("first append should work");
@@ -551,7 +647,7 @@ mod tests {
             log.active_path().to_owned()
         };
 
-        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024)
+        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
             .expect("partition log should recover");
         assert_eq!(log.next_offset(), 2);
         assert_eq!(
@@ -575,7 +671,7 @@ mod tests {
     fn truncates_an_incomplete_tail_when_reopened() {
         let data_dir = tempdir().expect("temporary directory should be created");
         let path = {
-            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024)
+            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
                 .expect("partition log should be created");
             log.append(&Record::new(None, Bytes::from_static(b"complete"), 1))
                 .expect("append should work");
@@ -591,7 +687,7 @@ mod tests {
             .expect("partial record should be written");
         drop(file);
 
-        let log = PartitionLog::open(data_dir.path(), "payments", 0, 1024)
+        let log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
             .expect("partition log should recover");
 
         assert_eq!(log.next_offset(), 1);
@@ -606,7 +702,7 @@ mod tests {
     #[test]
     fn reads_records_from_requested_offset() {
         let data_dir = tempdir().expect("temporary directory should be created");
-        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024)
+        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
             .expect("partition log should be created");
         for value in ["zero", "one", "two"] {
             log.append(&Record::new(
@@ -628,10 +724,43 @@ mod tests {
     }
 
     #[test]
+    fn rebuilds_sparse_index_from_segment_log() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let index_path = {
+            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 1)
+                .expect("partition log should be created");
+            for value in ["zero", "one", "two"] {
+                log.append(&Record::new(
+                    None,
+                    Bytes::copy_from_slice(value.as_bytes()),
+                    1,
+                ))
+                .expect("append should work");
+            }
+            log.flush().expect("log should flush");
+            log.active_path().with_extension("idx")
+        };
+
+        fs::write(&index_path, b"broken index").expect("index should be corrupted");
+        let log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 1)
+            .expect("index should be rebuilt from the log");
+        let records = log.read(2, 1024).expect("indexed read should work");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset(), 2);
+        assert_eq!(
+            fs::metadata(index_path)
+                .expect("index metadata should exist")
+                .len(),
+            3 * u64::try_from(INDEX_ENTRY_SIZE).expect("index entry size should fit in u64")
+        );
+    }
+
+    #[test]
     fn rotates_recovers_and_reads_across_segments() {
         let data_dir = tempdir().expect("temporary directory should be created");
         {
-            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 75)
+            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 75, 64)
                 .expect("partition log should be created");
             for value in ["zero", "one", "two"] {
                 log.append(&Record::new(
@@ -655,7 +784,7 @@ mod tests {
             );
         }
 
-        let log = PartitionLog::open(data_dir.path(), "payments", 0, 75)
+        let log = PartitionLog::open(data_dir.path(), "payments", 0, 75, 64)
             .expect("partition log should recover");
         let records = log.read(1, 1024).expect("read should cross segments");
 
