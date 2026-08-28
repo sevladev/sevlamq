@@ -1,0 +1,68 @@
+use std::{fs, net::SocketAddr, path::Path};
+
+use serde::Deserialize;
+use thiserror::Error;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Config {
+    pub broker: BrokerConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BrokerConfig {
+    pub host: String,
+    pub port: u16,
+    pub data_dir: String,
+}
+
+impl Config {
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let contents = fs::read_to_string(path).map_err(ConfigError::Read)?;
+        toml::from_str(&contents).map_err(ConfigError::Parse)
+    }
+}
+
+impl BrokerConfig {
+    pub fn socket_addr(&self) -> Result<SocketAddr, ConfigError> {
+        format!("{}:{}", self.host, self.port)
+            .parse()
+            .map_err(ConfigError::Address)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("failed to read configuration: {0}")]
+    Read(std::io::Error),
+    #[error("failed to parse configuration: {0}")]
+    Parse(toml::de::Error),
+    #[error("invalid broker address: {0}")]
+    Address(std::net::AddrParseError),
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn parses_broker_configuration() {
+        let config: Config = toml::from_str(
+            r#"
+                [broker]
+                host = "127.0.0.1"
+                port = 7400
+                data_dir = "./data"
+            "#,
+        )
+        .expect("configuration should be valid");
+
+        assert_eq!(config.broker.host, "127.0.0.1");
+        assert_eq!(config.broker.port, 7400);
+        assert_eq!(config.broker.data_dir, "./data");
+        assert_eq!(
+            config.broker.socket_addr().expect("address should parse"),
+            "127.0.0.1:7400".parse().expect("test address should parse")
+        );
+    }
+}
