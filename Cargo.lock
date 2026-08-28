@@ -12,6 +12,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytes"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -192,10 +198,23 @@ dependencies = [
 name = "sevlamq-broker"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "sevlamq-client",
  "sevlamq-common",
+ "sevlamq-protocol",
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "sevlamq-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "sevlamq-protocol",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -205,6 +224,14 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "sevlamq-protocol"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
 ]
 
 [[package]]
@@ -311,6 +338,7 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

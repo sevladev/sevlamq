@@ -2,7 +2,9 @@
 members = [
     "bin/sevlamqd",
     "crates/broker",
+    "crates/client",
     "crates/common",
+    "crates/protocol",
 ]
 resolver = "2"
 
@@ -14,9 +16,10 @@ repository = "https://github.com/darlysson/sevlamq"
 rust-version = "1.98"
 
 [workspace.dependencies]
+bytes = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
-tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -1,5 +1,5 @@
 [package]
-name = "sevlamq-broker"
+name = "sevlamq-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,14 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 bytes.workspace = true
-sevlamq-common = { path = "../common" }
-sevlamq-protocol = { path = "../protocol" }
 thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-sevlamq-client = { path = "../client" }
