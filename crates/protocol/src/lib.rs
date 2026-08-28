@@ -146,10 +146,39 @@ pub struct ProduceRequest {
     topic: String,
     key: Bytes,
     payload: Bytes,
+    ack_mode: AckMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckMode {
+    Leader,
+    Durable,
+}
+
+impl AckMode {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Leader => 1,
+            Self::Durable => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, ProtocolError> {
+        match code {
+            1 => Ok(Self::Leader),
+            2 => Ok(Self::Durable),
+            _ => Err(ProtocolError::InvalidAckMode(code)),
+        }
+    }
 }
 
 impl ProduceRequest {
-    pub fn new(topic: String, key: Bytes, payload: Bytes) -> Result<Self, ProtocolError> {
+    pub fn new(
+        topic: String,
+        key: Bytes,
+        payload: Bytes,
+        ack_mode: AckMode,
+    ) -> Result<Self, ProtocolError> {
         validate_topic(&topic)?;
         validate_size(key.len(), MAX_KEY_SIZE, ProtocolError::KeyTooLarge)?;
         validate_size(
@@ -161,6 +190,7 @@ impl ProduceRequest {
             topic,
             key,
             payload,
+            ack_mode,
         })
     }
 
@@ -177,6 +207,11 @@ impl ProduceRequest {
     #[must_use]
     pub const fn payload(&self) -> &Bytes {
         &self.payload
+    }
+
+    #[must_use]
+    pub const fn ack_mode(&self) -> AckMode {
+        self.ack_mode
     }
 }
 
@@ -447,12 +482,14 @@ fn decode_produce(mut frame: BytesMut) -> Result<ProduceRequest, ProtocolError> 
         ProtocolError::MessageTooLarge,
     )?;
     let payload = read_bytes(&mut frame, payload_len)?;
+    ensure_remaining(&frame, 1)?;
+    let ack_mode = AckMode::from_code(frame.get_u8())?;
 
     if frame.has_remaining() {
         return Err(ProtocolError::InvalidFrame);
     }
 
-    ProduceRequest::new(topic, key, payload)
+    ProduceRequest::new(topic, key, payload, ack_mode)
 }
 
 fn decode_fetch(mut frame: BytesMut) -> Result<FetchRequest, ProtocolError> {
@@ -475,7 +512,8 @@ fn decode_fetch(mut frame: BytesMut) -> Result<FetchRequest, ProtocolError> {
 }
 
 fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
-    let frame_len = 1 + 2 + request.topic.len() + 2 + request.key.len() + 4 + request.payload.len();
+    let frame_len =
+        1 + 2 + request.topic.len() + 2 + request.key.len() + 4 + request.payload.len() + 1;
     buffer.put_u32(u32::try_from(frame_len).map_err(|_| ProtocolError::FrameTooLarge)?);
     buffer.put_u8(PRODUCE);
     buffer.put_u16(u16::try_from(request.topic.len()).map_err(|_| ProtocolError::TopicTooLarge)?);
@@ -485,6 +523,7 @@ fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(),
     buffer
         .put_u32(u32::try_from(request.payload.len()).map_err(|_| ProtocolError::MessageTooLarge)?);
     buffer.extend_from_slice(&request.payload);
+    buffer.put_u8(request.ack_mode.code());
     Ok(())
 }
 
@@ -858,6 +897,8 @@ pub enum ProtocolError {
     FetchTooLarge,
     #[error("fetch wait exceeds the configured limit")]
     FetchWaitTooLong,
+    #[error("produce ack mode {0} is not supported")]
+    InvalidAckMode(u8),
 }
 
 #[cfg(test)]
@@ -876,6 +917,7 @@ mod tests {
                 "payments".to_owned(),
                 Bytes::from_static(b"customer-123"),
                 Bytes::from_static(br#"{"amount":150}"#),
+                super::AckMode::Leader,
             )
             .expect("request should be valid"),
         )

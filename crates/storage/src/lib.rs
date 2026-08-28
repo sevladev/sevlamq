@@ -145,8 +145,12 @@ impl PartitionLog {
         if index_interval_bytes == 0 {
             return Err(StorageError::InvalidIndexInterval);
         }
-        let partition_dir = data_dir.as_ref().join(topic).join(partition.to_string());
+        let data_dir = data_dir.as_ref();
+        let partition_dir = data_dir.join(topic).join(partition.to_string());
         fs::create_dir_all(&partition_dir)?;
+        File::open(data_dir)?.sync_all()?;
+        File::open(data_dir.join(topic))?.sync_all()?;
+        File::open(&partition_dir)?.sync_all()?;
         let mut segments = discover_segments(&partition_dir)?;
         if segments.is_empty() {
             segments.push(create_segment(&partition_dir, 0)?);
@@ -246,6 +250,12 @@ impl PartitionLog {
     pub fn flush(&mut self) -> Result<(), StorageError> {
         self.active_file.flush()?;
         self.active_index_file.flush()?;
+        Ok(())
+    }
+
+    pub fn sync_data(&mut self) -> Result<(), StorageError> {
+        self.active_file.sync_data()?;
+        self.active_index_file.sync_data()?;
         Ok(())
     }
 
@@ -455,6 +465,7 @@ fn create_segment(partition_dir: &Path, base_offset: u64) -> Result<SegmentMetad
         .write(true)
         .create_new(true)
         .open(index_path(&path))?;
+    File::open(partition_dir)?.sync_all()?;
     Ok(SegmentMetadata {
         base_offset,
         path,

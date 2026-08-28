@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
 use sevlamq_protocol::{
-    CommitOffsetRequest, FetchCommittedOffsetRequest, FetchRequest, FetchResponse,
+    AckMode, CommitOffsetRequest, FetchCommittedOffsetRequest, FetchRequest, FetchResponse,
     GroupFetchRequest, GroupGenerationRequest, GroupMemberRequest, JoinGroupResponse, ProduceAck,
     ProduceRequest, Request, Response, decode_response, encode_request,
 };
@@ -33,8 +33,9 @@ impl Client {
         topic: String,
         key: Bytes,
         payload: Bytes,
+        ack_mode: AckMode,
     ) -> Result<ProduceAck, ClientError> {
-        let request = Request::Produce(ProduceRequest::new(topic, key, payload)?);
+        let request = Request::Produce(ProduceRequest::new(topic, key, payload, ack_mode)?);
         match self.request(request).await? {
             Response::ProduceAck(ack) => Ok(ack),
             _ => Err(ClientError::UnexpectedResponse),

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "sevlamq", version, about = "Command-line client for SevlaMQ")]
@@ -20,6 +20,8 @@ pub enum Command {
         message: String,
         #[arg(long)]
         key: Option<String>,
+        #[arg(long, value_enum, default_value_t = ProduceAcks::Leader)]
+        acks: ProduceAcks,
     },
     /// Reads persisted records starting at an offset.
     Fetch {
@@ -38,6 +40,38 @@ pub enum Command {
         #[command(subcommand)]
         command: GroupCommand,
     },
+    /// Runs a coordinated consumer with automatic heartbeat and commits.
+    Consume {
+        topic: String,
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        member: String,
+        #[arg(long, value_enum, default_value_t = DeliveryMode::AtLeastOnce)]
+        delivery: DeliveryMode,
+        #[arg(long, default_value_t = 1_000)]
+        wait_ms: u32,
+        #[arg(
+            long,
+            default_value_t = 3_000,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        heartbeat_ms: u64,
+        #[arg(long, default_value_t = 1024 * 1024)]
+        max_bytes: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ProduceAcks {
+    Leader,
+    Durable,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum DeliveryMode {
+    AtMostOnce,
+    AtLeastOnce,
 }
 
 #[derive(Debug, Subcommand)]
@@ -116,7 +150,7 @@ mod tests {
         .expect("produce command should parse");
         assert!(matches!(
             cli.command,
-            Command::Produce { topic, message, key }
+            Command::Produce { topic, message, key, .. }
                 if topic == "payments" && message == "hello"
                     && key.as_deref() == Some("customer-123")
         ));
@@ -164,6 +198,24 @@ mod tests {
                     offset: 13,
                     ..
                 }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_high_level_consumer_defaults() {
+        let cli = Cli::try_parse_from([
+            "sevlamq", "consume", "payments", "--group", "workers", "--member", "worker-a",
+        ])
+        .expect("consumer command should parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::Consume {
+                delivery: super::DeliveryMode::AtLeastOnce,
+                wait_ms: 1_000,
+                heartbeat_ms: 3_000,
+                ..
             }
         ));
     }

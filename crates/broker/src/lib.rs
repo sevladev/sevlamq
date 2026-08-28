@@ -12,8 +12,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use sevlamq_common::BrokerConfig;
 use sevlamq_protocol::{
-    FetchResponse, FetchedRecord, GroupFetchRequest, ProduceAck, Request, Response, decode_request,
-    encode_response,
+    AckMode, FetchResponse, FetchedRecord, GroupFetchRequest, ProduceAck, Request, Response,
+    decode_request, encode_response,
 };
 use sevlamq_storage::{PartitionLog, Record, discover_partitions};
 use thiserror::Error;
@@ -126,6 +126,7 @@ async fn handle_connection(
                             request.topic().to_owned(),
                             request.key().clone(),
                             request.payload().clone(),
+                            request.ack_mode(),
                         )
                         .await?;
                     debug!(
@@ -340,6 +341,7 @@ impl StorageHandle {
         topic: String,
         key: Bytes,
         value: Bytes,
+        ack_mode: AckMode,
     ) -> Result<ProduceAck, ConnectionError> {
         let (reply, response) = oneshot::channel();
         self.sender
@@ -347,6 +349,7 @@ impl StorageHandle {
                 topic,
                 key,
                 value,
+                ack_mode,
                 reply,
             })
             .await
@@ -413,6 +416,7 @@ enum StorageCommand {
         topic: String,
         key: Bytes,
         value: Bytes,
+        ack_mode: AckMode,
         reply: oneshot::Sender<Result<ProduceAck, sevlamq_storage::StorageError>>,
     },
     Read {
@@ -467,10 +471,18 @@ async fn start_storage_worker(
                     topic,
                     key,
                     value,
+                    ack_mode,
                     reply,
                 } => {
-                    let result =
-                        append_record(&settings, &mut logs, &mut round_robin, &topic, key, value);
+                    let result = append_record(
+                        &settings,
+                        &mut logs,
+                        &mut round_robin,
+                        &topic,
+                        key,
+                        value,
+                        ack_mode,
+                    );
                     let _ = reply.send(result);
                 }
                 StorageCommand::Read {
@@ -541,6 +553,7 @@ fn append_record(
     topic: &str,
     key: Bytes,
     value: Bytes,
+    ack_mode: AckMode,
 ) -> Result<ProduceAck, sevlamq_storage::StorageError> {
     ensure_topic_partitions(settings, logs, topic)?;
     let partition = select_partition(settings.default_partition_count, round_robin, topic, &key);
@@ -557,6 +570,9 @@ fn append_record(
     .map_err(|_| sevlamq_storage::StorageError::InvalidTimestamp)?;
     let key = (!key.is_empty()).then_some(key);
     let offset = log.append(&Record::new(key, value, timestamp_ms))?;
+    if ack_mode == AckMode::Durable {
+        log.sync_data()?;
+    }
     Ok(ProduceAck { partition, offset })
 }
 
@@ -606,7 +622,7 @@ fn read_records(
 ) -> Result<Vec<FetchedRecord>, sevlamq_storage::StorageError> {
     let partition_key = (topic.to_owned(), partition);
     if !logs.contains_key(&partition_key) {
-        if partition != 0 {
+        if partition >= settings.default_partition_count {
             return Err(sevlamq_storage::StorageError::UnknownPartition(partition));
         }
         logs.insert(
@@ -614,7 +630,7 @@ fn read_records(
             PartitionLog::open(
                 &settings.data_dir,
                 topic,
-                0,
+                partition,
                 settings.max_segment_bytes,
                 settings.index_interval_bytes,
             )?,
@@ -696,6 +712,7 @@ mod tests {
 
     use bytes::Bytes;
     use sevlamq_client::Client;
+    use sevlamq_protocol::AckMode;
     use sevlamq_storage::{PartitionLog, Record};
     use tempfile::tempdir;
     use tokio::{net::TcpListener, time::timeout};
@@ -767,6 +784,7 @@ mod tests {
                 "payments".to_owned(),
                 Bytes::new(),
                 Bytes::from_static(b"hello"),
+                AckMode::Durable,
             )
             .await
             .expect("append should wake waiting fetch");
@@ -778,6 +796,28 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].offset, 0);
         assert_eq!(records[0].value, Bytes::from_static(b"hello"));
+        drop(storage);
+        storage_worker
+            .await
+            .expect("storage worker should finish")
+            .expect("storage should close cleanly");
+    }
+
+    #[tokio::test]
+    async fn fetches_an_empty_partition_before_the_first_produce() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let (storage, storage_worker) =
+            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3)
+                .await
+                .expect("storage worker should start");
+
+        let records = storage
+            .read("payments".to_owned(), 2, 0, 1024, 0)
+            .await
+            .expect("configured partition should open lazily");
+
+        assert!(records.is_empty());
+        assert!(data_dir.path().join("payments/2").is_dir());
         drop(storage);
         storage_worker
             .await
@@ -817,6 +857,7 @@ mod tests {
                         "payments".to_owned(),
                         Bytes::from_static(b"customer-123"),
                         Bytes::copy_from_slice(value.as_bytes()),
+                        AckMode::Leader,
                     )
                     .await
                     .expect("broker should acknowledge produce");
