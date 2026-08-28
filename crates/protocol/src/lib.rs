@@ -799,7 +799,7 @@ fn ensure_empty(buffer: &BytesMut) -> Result<(), ProtocolError> {
 
 fn validate_topic(topic: &str) -> Result<(), ProtocolError> {
     validate_size(topic.len(), MAX_TOPIC_NAME, ProtocolError::TopicTooLarge)?;
-    if topic.is_empty() {
+    if topic.is_empty() || topic.starts_with("__") {
         return Err(ProtocolError::InvalidTopic);
     }
     Ok(())

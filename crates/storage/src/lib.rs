@@ -343,6 +343,9 @@ pub fn discover_partitions(
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or(StorageError::InvalidTopic)?;
+        if topic.starts_with("__") {
+            continue;
+        }
         validate_topic(topic)?;
 
         for partition_entry in fs::read_dir(&topic_path)? {
@@ -580,6 +583,7 @@ fn read_bytes(buffer: &mut BytesMut, len: usize) -> Result<Bytes, StorageError> 
 
 fn validate_topic(topic: &str) -> Result<(), StorageError> {
     if topic.is_empty()
+        || topic.starts_with("__")
         || !topic
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -640,7 +644,29 @@ mod tests {
     use bytes::{Bytes, BytesMut};
     use tempfile::tempdir;
 
-    use super::{INDEX_ENTRY_SIZE, PartitionLog, Record, decode_record};
+    use super::{INDEX_ENTRY_SIZE, PartitionLog, Record, decode_record, discover_partitions};
+
+    #[test]
+    fn ignores_internal_broker_directories_during_partition_discovery() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        fs::create_dir_all(
+            data_dir
+                .path()
+                .join("__consumer_offsets")
+                .join("workers")
+                .join("payments"),
+        )
+        .expect("internal metadata directory should be created");
+        let _log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
+            .expect("partition log should be created");
+
+        let partitions =
+            discover_partitions(data_dir.path()).expect("internal directories should be ignored");
+
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].topic(), "payments");
+        assert_eq!(partitions[0].partition(), 0);
+    }
 
     #[test]
     fn appends_records_with_monotonic_offsets() {
