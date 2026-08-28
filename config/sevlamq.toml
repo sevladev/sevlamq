@@ -8,7 +8,13 @@ default_partition_count = 3
 group_session_timeout_ms = 10000
 retention_bytes = 1073741824
 retention_ms = 604800000
+storage_queue_capacity = 1024
+storage_enqueue_timeout_ms = 100
+auto_create_topics = true
 
 [admin]
 host = "127.0.0.1"
 port = 7401
+
+[logging]
+json = false

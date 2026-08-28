@@ -35,19 +35,24 @@ use groups::{GroupCoordinator, GroupIdentity};
 use observability::RuntimeMetrics;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
-const STORAGE_QUEUE_CAPACITY: usize = 1024;
 
 pub async fn run(config: &BrokerConfig, admin_config: &AdminConfig) -> Result<(), BrokerError> {
     let address = config.socket_addr()?;
-    let (storage, storage_worker) = start_storage_worker(
-        PathBuf::from(&config.data_dir),
-        config.max_segment_bytes,
-        config.index_interval_bytes,
-        config.default_partition_count,
-        config.retention_bytes,
-        config.retention_ms,
-    )
-    .await?;
+    let metrics = Arc::new(RuntimeMetrics::default());
+    let storage_settings = StorageSettings {
+        data_dir: PathBuf::from(&config.data_dir),
+        max_segment_bytes: config.max_segment_bytes,
+        index_interval_bytes: config.index_interval_bytes,
+        default_partition_count: config.default_partition_count,
+        retention_bytes: (config.retention_bytes > 0).then_some(config.retention_bytes),
+        retention_age: (config.retention_ms > 0)
+            .then(|| Duration::from_millis(config.retention_ms)),
+        auto_create_topics: config.auto_create_topics,
+        queue_capacity: config.storage_queue_capacity,
+        enqueue_timeout: Duration::from_millis(config.storage_enqueue_timeout_ms),
+    };
+    let (storage, storage_worker) =
+        start_storage_worker(storage_settings, Arc::clone(&metrics)).await?;
     let listener = TcpListener::bind(address).await?;
     let admin_address = admin_config.socket_addr()?;
     let admin_listener = TcpListener::bind(admin_address).await?;
@@ -64,7 +69,6 @@ pub async fn run(config: &BrokerConfig, admin_config: &AdminConfig) -> Result<()
         groups.set_topic_partitions(&topic.topic, topic.partitions)?;
     }
 
-    let metrics = Arc::new(RuntimeMetrics::default());
     info!(%address, %admin_address, data_dir = %config.data_dir, "broker started");
     accept_connections(&listener, &admin_listener, storage.clone(), groups, metrics).await?;
     info!("shutdown signal received");
@@ -137,8 +141,29 @@ async fn handle_connection(
         }
 
         while let Some(request) = decode_request(&mut read_buffer)? {
+            let operation = match &request {
+                Request::Produce(_) | Request::ProduceBatch(_) => Some("produce"),
+                Request::Fetch(_) | Request::GroupFetch(_) => Some("fetch"),
+                _ => None,
+            };
+            let started = Instant::now();
             let response =
-                process_request(request, &storage, &groups, &metrics, connection_id, peer).await?;
+                match process_request(request, &storage, &groups, &metrics, connection_id, peer)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(ConnectionError::BrokerBusy) => {
+                        metrics.broker_busy();
+                        Response::Error("broker busy: storage queue timeout".to_owned())
+                    }
+                    Err(ConnectionError::Storage(error)) => Response::Error(error.to_string()),
+                    Err(error) => return Err(error),
+                };
+            match operation {
+                Some("produce") => metrics.observe_produce(started.elapsed()),
+                Some("fetch") => metrics.observe_fetch(started.elapsed()),
+                _ => {}
+            }
             encode_response(&response, &mut write_buffer)?;
             stream.write_all(&write_buffer).await?;
             write_buffer.clear();
@@ -329,8 +354,22 @@ async fn handle_admin_connection(
         .unwrap_or_default();
     let path = request_line.split_ascii_whitespace().nth(1);
     match path {
-        Some("/health/live" | "/health/ready") => {
+        Some("/health/live") => {
             write_http_response(&mut stream, "200 OK", "text/plain", "ok\n").await
+        }
+        Some("/health/ready") => {
+            let ready = storage.snapshot().await.is_ok() && groups.snapshot().await.is_ok();
+            if ready {
+                write_http_response(&mut stream, "200 OK", "text/plain", "ready\n").await
+            } else {
+                write_http_response(
+                    &mut stream,
+                    "503 Service Unavailable",
+                    "text/plain",
+                    "not ready\n",
+                )
+                .await
+            }
         }
         Some("/metrics") => {
             let queue_depth = storage.queue_depth();
@@ -693,6 +732,7 @@ fn execute_group_request(
 struct StorageHandle {
     sender: mpsc::Sender<StorageCommand>,
     new_records: Arc<Notify>,
+    enqueue_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -706,6 +746,13 @@ struct PartitionSnapshot {
 }
 
 impl StorageHandle {
+    async fn enqueue(&self, command: StorageCommand) -> Result<(), ConnectionError> {
+        match tokio::time::timeout(self.enqueue_timeout, self.sender.send(command)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(ConnectionError::StorageUnavailable),
+            Err(_) => Err(ConnectionError::BrokerBusy),
+        }
+    }
     fn queue_depth(&self) -> usize {
         self.sender.max_capacity() - self.sender.capacity()
     }
@@ -716,14 +763,12 @@ impl StorageHandle {
         partitions: u32,
     ) -> Result<TopicMetadata, ConnectionError> {
         let (reply, response) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::CreateTopic {
-                topic,
-                partitions,
-                reply,
-            })
-            .await
-            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        self.enqueue(StorageCommand::CreateTopic {
+            topic,
+            partitions,
+            reply,
+        })
+        .await?;
         response
             .await
             .map_err(|_| ConnectionError::StorageUnavailable)?
@@ -732,10 +777,7 @@ impl StorageHandle {
 
     async fn list_topics(&self) -> Result<Vec<TopicMetadata>, ConnectionError> {
         let (reply, response) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::ListTopics { reply })
-            .await
-            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        self.enqueue(StorageCommand::ListTopics { reply }).await?;
         response
             .await
             .map_err(|_| ConnectionError::StorageUnavailable)
@@ -753,10 +795,7 @@ impl StorageHandle {
 
     async fn snapshot(&self) -> Result<Vec<PartitionSnapshot>, ConnectionError> {
         let (reply, response) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::Snapshot { reply })
-            .await
-            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        self.enqueue(StorageCommand::Snapshot { reply }).await?;
         response
             .await
             .map_err(|_| ConnectionError::StorageUnavailable)
@@ -771,17 +810,15 @@ impl StorageHandle {
         producer: Option<StorageProducerIdentity>,
     ) -> Result<ProduceAck, ConnectionError> {
         let (reply, response) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::Append {
-                topic,
-                key,
-                value,
-                ack_mode,
-                producer,
-                reply,
-            })
-            .await
-            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        self.enqueue(StorageCommand::Append {
+            topic,
+            key,
+            value,
+            ack_mode,
+            producer,
+            reply,
+        })
+        .await?;
         let ack = response
             .await
             .map_err(|_| ConnectionError::StorageUnavailable)?
@@ -797,15 +834,13 @@ impl StorageHandle {
         ack_mode: AckMode,
     ) -> Result<Vec<ProduceAck>, ConnectionError> {
         let (reply, response) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::AppendBatch {
-                topic,
-                records,
-                ack_mode,
-                reply,
-            })
-            .await
-            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        self.enqueue(StorageCommand::AppendBatch {
+            topic,
+            records,
+            ack_mode,
+            reply,
+        })
+        .await?;
         let acks = response
             .await
             .map_err(|_| ConnectionError::StorageUnavailable)?
@@ -846,16 +881,14 @@ impl StorageHandle {
         max_bytes: u32,
     ) -> Result<Vec<FetchedRecord>, ConnectionError> {
         let (reply, response) = oneshot::channel();
-        self.sender
-            .send(StorageCommand::Read {
-                topic: topic.to_owned(),
-                partition,
-                offset,
-                max_bytes,
-                reply,
-            })
-            .await
-            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        self.enqueue(StorageCommand::Read {
+            topic: topic.to_owned(),
+            partition,
+            offset,
+            max_bytes,
+            reply,
+        })
+        .await?;
         response
             .await
             .map_err(|_| ConnectionError::StorageUnavailable)?
@@ -906,6 +939,9 @@ struct StorageSettings {
     default_partition_count: u32,
     retention_bytes: Option<u64>,
     retention_age: Option<Duration>,
+    auto_create_topics: bool,
+    queue_capacity: usize,
+    enqueue_timeout: Duration,
 }
 
 struct AppendInput {
@@ -916,16 +952,18 @@ struct AppendInput {
     producer: Option<StorageProducerIdentity>,
 }
 
+struct BatchAppendInput {
+    topic: String,
+    records: Vec<BatchRecord>,
+    ack_mode: AckMode,
+}
+
 type PartitionKey = (String, u32);
 type PartitionLogs = HashMap<PartitionKey, PartitionLog>;
 
 async fn start_storage_worker(
-    data_dir: PathBuf,
-    max_segment_bytes: u64,
-    index_interval_bytes: u64,
-    default_partition_count: u32,
-    retention_bytes: u64,
-    retention_ms: u64,
+    settings: StorageSettings,
+    metrics: Arc<RuntimeMetrics>,
 ) -> Result<
     (
         StorageHandle,
@@ -933,20 +971,17 @@ async fn start_storage_worker(
     ),
     BrokerError,
 > {
-    if default_partition_count == 0 {
+    if settings.default_partition_count == 0 {
         return Err(BrokerError::InvalidPartitionCount);
     }
-    let settings = StorageSettings {
-        data_dir,
-        max_segment_bytes,
-        index_interval_bytes,
-        default_partition_count,
-        retention_bytes: (retention_bytes > 0).then_some(retention_bytes),
-        retention_age: (retention_ms > 0).then(|| Duration::from_millis(retention_ms)),
-    };
+    if settings.queue_capacity == 0 || settings.enqueue_timeout.is_zero() {
+        return Err(BrokerError::InvalidStorageQueueConfig);
+    }
+    let queue_capacity = settings.queue_capacity;
+    let enqueue_timeout = settings.enqueue_timeout;
     let (settings, mut logs, mut topics) =
         tokio::task::spawn_blocking(move || recover_storage(settings)).await??;
-    let (sender, mut receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
+    let (sender, mut receiver) = mpsc::channel(queue_capacity);
     let retention_sender = sender.downgrade();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -963,13 +998,14 @@ async fn start_storage_worker(
     });
     let new_records = Arc::new(Notify::new());
     let worker = tokio::task::spawn_blocking(move || {
-        run_storage_worker(&settings, &mut logs, &mut topics, &mut receiver);
+        run_storage_worker(&settings, &mut logs, &mut topics, &mut receiver, &metrics);
         Ok(())
     });
     Ok((
         StorageHandle {
             sender,
             new_records,
+            enqueue_timeout,
         },
         worker,
     ))
@@ -980,6 +1016,7 @@ fn run_storage_worker(
     logs: &mut PartitionLogs,
     topics: &mut HashMap<String, u32>,
     receiver: &mut mpsc::Receiver<StorageCommand>,
+    metrics: &RuntimeMetrics,
 ) {
     let mut round_robin = HashMap::<String, u32>::new();
     while let Some(command) = receiver.blocking_recv() {
@@ -1018,7 +1055,8 @@ fn run_storage_worker(
                     ack_mode,
                     producer,
                 };
-                let result = append_record(settings, logs, topics, &mut round_robin, input);
+                let result =
+                    append_record(settings, logs, topics, &mut round_robin, input, metrics);
                 let _ = reply.send(result);
             }
             StorageCommand::AppendBatch {
@@ -1032,9 +1070,12 @@ fn run_storage_worker(
                     logs,
                     topics,
                     &mut round_robin,
-                    &topic,
-                    records,
-                    ack_mode,
+                    BatchAppendInput {
+                        topic,
+                        records,
+                        ack_mode,
+                    },
+                    metrics,
                 );
                 let _ = reply.send(result);
             }
@@ -1067,16 +1108,21 @@ fn run_storage_worker(
                 let _ = reply.send(snapshots);
             }
             StorageCommand::ApplyRetention => {
-                for ((topic, partition), log) in logs.iter_mut() {
-                    match log.apply_retention(settings.retention_bytes, settings.retention_age) {
-                        Ok(removed) if removed > 0 => {
-                            info!(topic, partition, removed, "expired log segments removed");
-                        }
-                        Ok(_) => {}
-                        Err(error) => warn!(topic, partition, %error, "retention failed"),
-                    }
-                }
+                apply_retention(settings, logs, metrics);
             }
+        }
+    }
+}
+
+fn apply_retention(settings: &StorageSettings, logs: &mut PartitionLogs, metrics: &RuntimeMetrics) {
+    for ((topic, partition), log) in logs {
+        match log.apply_retention(settings.retention_bytes, settings.retention_age) {
+            Ok(removed) if removed > 0 => {
+                metrics.retention_removed(removed);
+                info!(topic, partition, removed, "expired log segments removed");
+            }
+            Ok(_) => {}
+            Err(error) => warn!(topic, partition, %error, "retention failed"),
         }
     }
 }
@@ -1125,6 +1171,7 @@ fn append_record(
     topics: &mut HashMap<String, u32>,
     round_robin: &mut HashMap<String, u32>,
     input: AppendInput,
+    metrics: &RuntimeMetrics,
 ) -> Result<ProduceAck, sevlamq_storage::StorageError> {
     let AppendInput {
         topic,
@@ -1156,9 +1203,13 @@ fn append_record(
     if let Some(producer) = producer {
         record = record.with_producer(producer);
     }
+    let append_started = Instant::now();
     let offset = log.append(&record)?;
+    metrics.observe_append(append_started.elapsed());
     if ack_mode == AckMode::Durable {
+        let flush_started = Instant::now();
         log.sync_data()?;
+        metrics.observe_flush(flush_started.elapsed());
     }
     Ok(ProduceAck { partition, offset })
 }
@@ -1168,10 +1219,14 @@ fn append_batch_records(
     logs: &mut PartitionLogs,
     topics: &mut HashMap<String, u32>,
     round_robin: &mut HashMap<String, u32>,
-    topic: &str,
-    records: Vec<BatchRecord>,
-    ack_mode: AckMode,
+    input: BatchAppendInput,
+    metrics: &RuntimeMetrics,
 ) -> Result<Vec<ProduceAck>, sevlamq_storage::StorageError> {
+    let BatchAppendInput {
+        topic,
+        records,
+        ack_mode,
+    } = input;
     let mut acks = Vec::with_capacity(records.len());
     for record in records {
         acks.push(append_record(
@@ -1180,12 +1235,13 @@ fn append_batch_records(
             topics,
             round_robin,
             AppendInput {
-                topic: topic.to_owned(),
+                topic: topic.clone(),
                 key: record.key,
                 value: record.payload,
                 ack_mode: AckMode::Leader,
                 producer: None,
             },
+            metrics,
         )?);
     }
     if ack_mode == AckMode::Durable {
@@ -1193,9 +1249,11 @@ fn append_batch_records(
         partitions.sort_unstable();
         partitions.dedup();
         for partition in partitions {
-            logs.get_mut(&(topic.to_owned(), partition))
+            let flush_started = Instant::now();
+            logs.get_mut(&(topic.clone(), partition))
                 .ok_or(sevlamq_storage::StorageError::InvalidTopic)?
                 .sync_data()?;
+            metrics.observe_flush(flush_started.elapsed());
         }
     }
     Ok(acks)
@@ -1209,6 +1267,9 @@ fn ensure_topic(
 ) -> Result<u32, sevlamq_storage::StorageError> {
     if let Some(partitions) = topics.get(topic) {
         return Ok(*partitions);
+    }
+    if !settings.auto_create_topics {
+        return Err(sevlamq_storage::StorageError::UnknownTopic);
     }
     create_topic(
         settings,
@@ -1357,6 +1418,8 @@ pub enum BrokerError {
     Group(#[from] groups::GroupError),
     #[error("default partition count must be greater than zero")]
     InvalidPartitionCount,
+    #[error("storage queue capacity and enqueue timeout must be greater than zero")]
+    InvalidStorageQueueConfig,
     #[error("storage worker is unavailable during broker startup")]
     StorageUnavailable,
     #[error(
@@ -1381,6 +1444,8 @@ enum ConnectionError {
     Storage(sevlamq_storage::StorageError),
     #[error("storage worker is unavailable")]
     StorageUnavailable,
+    #[error("broker busy: storage queue timeout")]
+    BrokerBusy,
 }
 
 #[cfg(test)]
@@ -1393,17 +1458,39 @@ mod tests {
     use sevlamq_protocol::{AckMode, BatchRecord};
     use sevlamq_storage::{PartitionLog, Record};
     use tempfile::tempdir;
-    use tokio::{net::TcpListener, time::timeout};
+    use tokio::{
+        net::TcpListener,
+        sync::{Notify, mpsc, oneshot},
+        time::timeout,
+    };
 
     use super::{
-        GroupHandle, PartitionSnapshot, RuntimeMetrics, handle_connection, render_metrics,
-        select_partition, start_storage_worker,
+        ConnectionError, GroupHandle, PartitionSnapshot, RuntimeMetrics, StorageCommand,
+        StorageHandle, StorageSettings, handle_connection, render_metrics, select_partition,
+        start_storage_worker,
     };
+
+    fn test_storage_settings(data_dir: &std::path::Path, partitions: u32) -> StorageSettings {
+        StorageSettings {
+            data_dir: data_dir.to_owned(),
+            max_segment_bytes: 1024,
+            index_interval_bytes: 64,
+            default_partition_count: partitions,
+            retention_bytes: None,
+            retention_age: None,
+            auto_create_topics: true,
+            queue_capacity: 1024,
+            enqueue_timeout: Duration::from_millis(100),
+        }
+    }
 
     #[test]
     fn renders_partition_and_consumer_group_lag_metrics() {
         let metrics = RuntimeMetrics::default();
         metrics.produced(2, 10);
+        metrics.broker_busy();
+        metrics.retention_removed(3);
+        metrics.observe_produce(Duration::from_millis(2));
         let partitions = vec![PartitionSnapshot {
             topic: "payments".to_owned(),
             partition: 0,
@@ -1424,6 +1511,9 @@ mod tests {
         let rendered = render_metrics(&metrics, 0, &partitions, &groups);
 
         assert!(rendered.contains("sevlamq_messages_produced_total 2"));
+        assert!(rendered.contains("sevlamq_broker_busy_total 1"));
+        assert!(rendered.contains("sevlamq_retention_segments_removed_total 3"));
+        assert!(rendered.contains("sevlamq_produce_duration_seconds_count 1"));
         assert!(
             rendered.contains(
                 "sevlamq_partition_log_size_bytes{topic=\"payments\",partition=\"0\"} 512"
@@ -1455,6 +1545,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_commands_when_storage_queue_timeout_expires() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (reply, _response) = oneshot::channel();
+        assert!(
+            sender
+                .try_send(StorageCommand::ListTopics { reply })
+                .is_ok()
+        );
+        let storage = StorageHandle {
+            sender,
+            new_records: Arc::new(Notify::new()),
+            enqueue_timeout: Duration::from_millis(1),
+        };
+
+        assert!(matches!(
+            storage.list_topics().await,
+            Err(ConnectionError::BrokerBusy)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_topics_when_auto_create_is_disabled() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let mut settings = test_storage_settings(data_dir.path(), 3);
+        settings.auto_create_topics = false;
+        let (storage, storage_worker) =
+            start_storage_worker(settings, Arc::new(RuntimeMetrics::default()))
+                .await
+                .expect("storage worker should start");
+
+        assert!(matches!(
+            storage.read("missing".to_owned(), 0, 0, 1024, 0).await,
+            Err(ConnectionError::Storage(
+                sevlamq_storage::StorageError::UnknownTopic
+            ))
+        ));
+        drop(storage);
+        storage_worker
+            .await
+            .expect("storage worker should finish")
+            .expect("storage should close cleanly");
+    }
+
+    #[tokio::test]
     async fn recovers_existing_partitions_before_starting_worker() {
         let data_dir = tempdir().expect("temporary directory should be created");
         let index_path = {
@@ -1467,10 +1601,12 @@ mod tests {
         };
         fs::write(&index_path, b"broken index").expect("index should be corrupted");
 
-        let (storage, storage_worker) =
-            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3, 0, 0)
-                .await
-                .expect("storage recovery should complete");
+        let (storage, storage_worker) = start_storage_worker(
+            test_storage_settings(data_dir.path(), 3),
+            Arc::new(RuntimeMetrics::default()),
+        )
+        .await
+        .expect("storage recovery should complete");
 
         assert_eq!(
             fs::metadata(index_path)
@@ -1488,10 +1624,12 @@ mod tests {
     #[tokio::test]
     async fn wakes_long_poll_when_a_record_is_appended() {
         let data_dir = tempdir().expect("temporary directory should be created");
-        let (storage, storage_worker) =
-            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 1, 0, 0)
-                .await
-                .expect("storage worker should start");
+        let (storage, storage_worker) = start_storage_worker(
+            test_storage_settings(data_dir.path(), 1),
+            Arc::new(RuntimeMetrics::default()),
+        )
+        .await
+        .expect("storage worker should start");
         let waiting_storage = storage.clone();
         let waiting = tokio::spawn(async move {
             waiting_storage
@@ -1528,10 +1666,12 @@ mod tests {
     #[tokio::test]
     async fn appends_a_durable_batch_and_returns_each_offset() {
         let data_dir = tempdir().expect("temporary directory should be created");
-        let (storage, storage_worker) =
-            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 1, 0, 0)
-                .await
-                .expect("storage worker should start");
+        let (storage, storage_worker) = start_storage_worker(
+            test_storage_settings(data_dir.path(), 1),
+            Arc::new(RuntimeMetrics::default()),
+        )
+        .await
+        .expect("storage worker should start");
 
         let acks = storage
             .append_batch(
@@ -1564,10 +1704,12 @@ mod tests {
     #[tokio::test]
     async fn fetches_an_empty_partition_before_the_first_produce() {
         let data_dir = tempdir().expect("temporary directory should be created");
-        let (storage, storage_worker) =
-            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3, 0, 0)
-                .await
-                .expect("storage worker should start");
+        let (storage, storage_worker) = start_storage_worker(
+            test_storage_settings(data_dir.path(), 3),
+            Arc::new(RuntimeMetrics::default()),
+        )
+        .await
+        .expect("storage worker should start");
 
         let records = storage
             .read("payments".to_owned(), 2, 0, 1024, 0)
@@ -1593,10 +1735,12 @@ mod tests {
                 .local_addr()
                 .expect("listener should have an address");
             let data_dir = tempdir().expect("temporary directory should be created");
-            let (storage, storage_worker) =
-                start_storage_worker(data_dir.path().to_owned(), 1024, 64, 3, 0, 0)
-                    .await
-                    .expect("storage worker should start");
+            let (storage, storage_worker) = start_storage_worker(
+                test_storage_settings(data_dir.path(), 3),
+                Arc::new(RuntimeMetrics::default()),
+            )
+            .await
+            .expect("storage worker should start");
             let connection_storage = storage.clone();
             let groups = GroupHandle::open(data_dir.path(), 3, Duration::from_secs(10))
                 .expect("group coordinator should start");

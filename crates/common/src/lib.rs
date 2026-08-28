@@ -8,6 +8,13 @@ pub struct Config {
     pub broker: BrokerConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct LoggingConfig {
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -36,6 +43,9 @@ pub struct BrokerConfig {
     pub group_session_timeout_ms: u64,
     pub retention_bytes: u64,
     pub retention_ms: u64,
+    pub storage_queue_capacity: usize,
+    pub storage_enqueue_timeout_ms: u64,
+    pub auto_create_topics: bool,
 }
 
 impl Config {
@@ -92,6 +102,9 @@ mod tests {
                 group_session_timeout_ms = 10000
                 retention_bytes = 0
                 retention_ms = 0
+                storage_queue_capacity = 1024
+                storage_enqueue_timeout_ms = 100
+                auto_create_topics = true
             "#,
         )
         .expect("configuration should be valid");
@@ -105,7 +118,11 @@ mod tests {
         assert_eq!(config.broker.group_session_timeout_ms, 10_000);
         assert_eq!(config.broker.retention_bytes, 0);
         assert_eq!(config.broker.retention_ms, 0);
+        assert_eq!(config.broker.storage_queue_capacity, 1024);
+        assert_eq!(config.broker.storage_enqueue_timeout_ms, 100);
+        assert!(config.broker.auto_create_topics);
         assert_eq!(config.admin, super::AdminConfig::default());
+        assert_eq!(config.logging, super::LoggingConfig::default());
         assert_eq!(
             config.broker.socket_addr().expect("address should parse"),
             "127.0.0.1:7400".parse().expect("test address should parse")
