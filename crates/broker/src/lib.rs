@@ -1,35 +1,47 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use sevlamq_common::BrokerConfig;
-use sevlamq_protocol::{Request, Response, decode_request, encode_response};
+use sevlamq_protocol::{ProduceAck, Request, Response, decode_request, encode_response};
+use sevlamq_storage::{PartitionLog, Record};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    task::JoinSet,
+    sync::{mpsc, oneshot},
+    task::{JoinHandle, JoinSet},
 };
 use tracing::{debug, info, warn};
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+const STORAGE_QUEUE_CAPACITY: usize = 1024;
 
 pub async fn run(config: &BrokerConfig) -> Result<(), BrokerError> {
     let address = config.socket_addr()?;
     let listener = TcpListener::bind(address).await?;
+    let (storage, storage_worker) = start_storage_worker(PathBuf::from(&config.data_dir));
 
     info!(%address, data_dir = %config.data_dir, "broker started");
-    accept_connections(&listener).await?;
+    accept_connections(&listener, storage.clone()).await?;
     info!("shutdown signal received");
 
+    drop(storage);
+    storage_worker.await??;
     drop(listener);
     info!("broker stopped");
     Ok(())
 }
 
-async fn accept_connections(listener: &TcpListener) -> Result<(), BrokerError> {
+async fn accept_connections(
+    listener: &TcpListener,
+    storage: StorageHandle,
+) -> Result<(), BrokerError> {
     let mut connections = JoinSet::new();
 
     loop {
@@ -41,7 +53,7 @@ async fn accept_connections(listener: &TcpListener) -> Result<(), BrokerError> {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
                 let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-                connections.spawn(handle_connection(stream, peer, connection_id));
+                connections.spawn(handle_connection(stream, peer, connection_id, storage.clone()));
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 report_connection_result(result);
@@ -60,6 +72,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
     connection_id: u64,
+    storage: StorageHandle,
 ) -> Result<(), ConnectionError> {
     let mut read_buffer = BytesMut::with_capacity(8 * 1024);
     let mut write_buffer = BytesMut::with_capacity(128);
@@ -84,7 +97,20 @@ async fn handle_connection(
                         payload_bytes = request.payload().len(),
                         "produce received"
                     );
-                    encode_response(Response::ProduceAck, &mut write_buffer);
+                    let offset = storage
+                        .append(
+                            request.topic().to_owned(),
+                            request.key().clone(),
+                            request.payload().clone(),
+                        )
+                        .await?;
+                    encode_response(
+                        Response::ProduceAck(ProduceAck {
+                            partition: 0,
+                            offset,
+                        }),
+                        &mut write_buffer,
+                    );
                     stream.write_all(&write_buffer).await?;
                     write_buffer.clear();
                 }
@@ -94,6 +120,95 @@ async fn handle_connection(
 
     debug!(connection_id, %peer, "connection closed");
     Ok(())
+}
+
+#[derive(Clone)]
+struct StorageHandle {
+    sender: mpsc::Sender<StorageCommand>,
+}
+
+impl StorageHandle {
+    async fn append(
+        &self,
+        topic: String,
+        key: Bytes,
+        value: Bytes,
+    ) -> Result<u64, ConnectionError> {
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(StorageCommand::Append {
+                topic,
+                key,
+                value,
+                reply,
+            })
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?;
+        response
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?
+            .map_err(ConnectionError::Storage)
+    }
+}
+
+enum StorageCommand {
+    Append {
+        topic: String,
+        key: Bytes,
+        value: Bytes,
+        reply: oneshot::Sender<Result<u64, sevlamq_storage::StorageError>>,
+    },
+}
+
+fn start_storage_worker(
+    data_dir: PathBuf,
+) -> (
+    StorageHandle,
+    JoinHandle<Result<(), sevlamq_storage::StorageError>>,
+) {
+    let (sender, mut receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut logs = HashMap::<String, PartitionLog>::new();
+        while let Some(command) = receiver.blocking_recv() {
+            match command {
+                StorageCommand::Append {
+                    topic,
+                    key,
+                    value,
+                    reply,
+                } => {
+                    let result = append_record(&data_dir, &mut logs, &topic, key, value);
+                    let _ = reply.send(result);
+                }
+            }
+        }
+        Ok(())
+    });
+    (StorageHandle { sender }, worker)
+}
+
+fn append_record(
+    data_dir: &Path,
+    logs: &mut HashMap<String, PartitionLog>,
+    topic: &str,
+    key: Bytes,
+    value: Bytes,
+) -> Result<u64, sevlamq_storage::StorageError> {
+    if !logs.contains_key(topic) {
+        logs.insert(topic.to_owned(), PartitionLog::open(data_dir, topic, 0)?);
+    }
+    let log = logs
+        .get_mut(topic)
+        .ok_or(sevlamq_storage::StorageError::InvalidTopic)?;
+    let timestamp_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| sevlamq_storage::StorageError::InvalidTimestamp)?
+            .as_millis(),
+    )
+    .map_err(|_| sevlamq_storage::StorageError::InvalidTimestamp)?;
+    let key = (!key.is_empty()).then_some(key);
+    log.append(&Record::new(key, value, timestamp_ms))
 }
 
 fn report_connection_result(result: Result<Result<(), ConnectionError>, tokio::task::JoinError>) {
@@ -115,6 +230,10 @@ pub enum BrokerError {
     Config(#[from] sevlamq_common::ConfigError),
     #[error("broker I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Storage(#[from] sevlamq_storage::StorageError),
+    #[error("storage worker failed: {0}")]
+    StorageWorker(#[from] tokio::task::JoinError),
 }
 
 #[derive(Debug, Error)]
@@ -125,6 +244,10 @@ enum ConnectionError {
     Protocol(#[from] sevlamq_protocol::ProtocolError),
     #[error("connection closed with a partial frame")]
     TruncatedFrame,
+    #[error(transparent)]
+    Storage(sevlamq_storage::StorageError),
+    #[error("storage worker is unavailable")]
+    StorageUnavailable,
 }
 
 #[cfg(test)]
@@ -134,9 +257,10 @@ mod tests {
 
     use bytes::Bytes;
     use sevlamq_client::Client;
+    use tempfile::tempdir;
     use tokio::{net::TcpListener, time::timeout};
 
-    use super::handle_connection;
+    use super::{handle_connection, start_storage_worker};
 
     #[tokio::test]
     async fn acknowledges_a_produce_request() {
@@ -147,15 +271,18 @@ mod tests {
             let address = listener
                 .local_addr()
                 .expect("listener should have an address");
+            let data_dir = tempdir().expect("temporary directory should be created");
+            let (storage, storage_worker) = start_storage_worker(data_dir.path().to_owned());
+            let connection_storage = storage.clone();
             let server = tokio::spawn(async move {
                 let (stream, peer) = listener.accept().await.expect("connection should arrive");
-                handle_connection(stream, peer, 1).await
+                handle_connection(stream, peer, 1, connection_storage).await
             });
 
             let mut client = Client::connect(address)
                 .await
                 .expect("client should connect");
-            client
+            let ack = client
                 .produce(
                     "payments".to_owned(),
                     Bytes::from_static(b"customer-123"),
@@ -163,12 +290,19 @@ mod tests {
                 )
                 .await
                 .expect("broker should acknowledge produce");
+            assert_eq!(ack.partition, 0);
+            assert_eq!(ack.offset, 0);
 
             drop(client);
             server
                 .await
                 .expect("connection task should finish")
                 .expect("connection should close cleanly");
+            drop(storage);
+            storage_worker
+                .await
+                .expect("storage worker should finish")
+                .expect("storage should close cleanly");
         })
         .await
         .expect("test should not time out");

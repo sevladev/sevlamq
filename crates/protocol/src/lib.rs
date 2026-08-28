@@ -56,7 +56,13 @@ impl ProduceRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Response {
-    ProduceAck,
+    ProduceAck(ProduceAck),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProduceAck {
+    pub partition: u32,
+    pub offset: u64,
 }
 
 pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, ProtocolError> {
@@ -99,9 +105,11 @@ pub fn encode_request(request: &Request, buffer: &mut BytesMut) -> Result<(), Pr
 
 pub fn encode_response(response: Response, buffer: &mut BytesMut) {
     match response {
-        Response::ProduceAck => {
-            buffer.put_u32(1);
+        Response::ProduceAck(ack) => {
+            buffer.put_u32(1 + 4 + 8);
             buffer.put_u8(PRODUCE_ACK);
+            buffer.put_u32(ack.partition);
+            buffer.put_u64(ack.offset);
         }
     }
 }
@@ -131,12 +139,16 @@ pub fn decode_response(buffer: &mut BytesMut) -> Result<Option<Response>, Protoc
     buffer.advance(FRAME_HEADER_SIZE);
     let mut frame = buffer.split_to(frame_len);
     let opcode = frame.get_u8();
-    if frame.has_remaining() {
-        return Err(ProtocolError::InvalidFrame);
-    }
-
     match opcode {
-        PRODUCE_ACK => Ok(Some(Response::ProduceAck)),
+        PRODUCE_ACK => {
+            if frame.remaining() != size_of::<u32>() + size_of::<u64>() {
+                return Err(ProtocolError::InvalidFrame);
+            }
+            Ok(Some(Response::ProduceAck(ProduceAck {
+                partition: frame.get_u32(),
+                offset: frame.get_u64(),
+            })))
+        }
         value => Err(ProtocolError::UnknownOpcode(value)),
     }
 }

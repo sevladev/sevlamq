@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
-use sevlamq_protocol::{ProduceRequest, Request, Response, decode_response, encode_request};
+use sevlamq_protocol::{
+    ProduceAck, ProduceRequest, Request, Response, decode_response, encode_request,
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -29,7 +31,7 @@ impl Client {
         topic: String,
         key: Bytes,
         payload: Bytes,
-    ) -> Result<(), ClientError> {
+    ) -> Result<ProduceAck, ClientError> {
         let request = Request::Produce(ProduceRequest::new(topic, key, payload)?);
         encode_request(&request, &mut self.write_buffer)?;
         self.stream.write_all(&self.write_buffer).await?;
@@ -38,7 +40,7 @@ impl Client {
         loop {
             if let Some(response) = decode_response(&mut self.read_buffer)? {
                 return match response {
-                    Response::ProduceAck => Ok(()),
+                    Response::ProduceAck(ack) => Ok(ack),
                 };
             }
 

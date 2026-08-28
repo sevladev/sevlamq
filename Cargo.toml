@@ -5,6 +5,7 @@ members = [
     "crates/client",
     "crates/common",
     "crates/protocol",
+    "crates/storage",
 ]
 resolver = "2"
 
@@ -17,12 +18,14 @@ rust-version = "1.98"
 
 [workspace.dependencies]
 bytes = "1.10"
+crc32fast = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tempfile = "3.23"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
