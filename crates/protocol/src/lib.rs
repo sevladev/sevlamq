@@ -6,6 +6,7 @@ pub const MAX_KEY_SIZE: usize = u16::MAX as usize;
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 pub const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 pub const MAX_FETCH_BYTES: usize = 3 * 1024 * 1024;
+pub const MAX_FETCH_WAIT_MS: u32 = 30_000;
 
 const FRAME_HEADER_SIZE: usize = size_of::<u32>();
 const PRODUCE: u8 = 0x01;
@@ -25,6 +26,7 @@ pub struct FetchRequest {
     partition: u32,
     offset: u64,
     max_bytes: u32,
+    max_wait_ms: u32,
 }
 
 impl FetchRequest {
@@ -33,6 +35,7 @@ impl FetchRequest {
         partition: u32,
         offset: u64,
         max_bytes: u32,
+        max_wait_ms: u32,
     ) -> Result<Self, ProtocolError> {
         validate_topic(&topic)?;
         let max_bytes_usize =
@@ -40,11 +43,15 @@ impl FetchRequest {
         if max_bytes == 0 || max_bytes_usize > MAX_FETCH_BYTES {
             return Err(ProtocolError::FetchTooLarge);
         }
+        if max_wait_ms > MAX_FETCH_WAIT_MS {
+            return Err(ProtocolError::FetchWaitTooLong);
+        }
         Ok(Self {
             topic,
             partition,
             offset,
             max_bytes,
+            max_wait_ms,
         })
     }
 
@@ -66,6 +73,11 @@ impl FetchRequest {
     #[must_use]
     pub const fn max_bytes(&self) -> u32 {
         self.max_bytes
+    }
+
+    #[must_use]
+    pub const fn max_wait_ms(&self) -> u32 {
+        self.max_wait_ms
     }
 }
 
@@ -275,15 +287,16 @@ fn decode_fetch(mut frame: BytesMut) -> Result<FetchRequest, ProtocolError> {
     let topic = String::from_utf8(topic.to_vec()).map_err(|_| ProtocolError::InvalidTopic)?;
     ensure_remaining(
         &frame,
-        size_of::<u32>() + size_of::<u64>() + size_of::<u32>(),
+        size_of::<u32>() + size_of::<u64>() + size_of::<u32>() * 2,
     )?;
     let partition = frame.get_u32();
     let offset = frame.get_u64();
     let max_bytes = frame.get_u32();
+    let max_wait_ms = frame.get_u32();
     if frame.has_remaining() {
         return Err(ProtocolError::InvalidFrame);
     }
-    FetchRequest::new(topic, partition, offset, max_bytes)
+    FetchRequest::new(topic, partition, offset, max_bytes, max_wait_ms)
 }
 
 fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
@@ -301,7 +314,7 @@ fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(),
 }
 
 fn encode_fetch(request: &FetchRequest, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
-    let frame_len = 1 + 2 + request.topic.len() + 4 + 8 + 4;
+    let frame_len = 1 + 2 + request.topic.len() + 4 + 8 + 4 + 4;
     buffer.put_u32(u32::try_from(frame_len).map_err(|_| ProtocolError::FrameTooLarge)?);
     buffer.put_u8(FETCH);
     buffer.put_u16(u16::try_from(request.topic.len()).map_err(|_| ProtocolError::TopicTooLarge)?);
@@ -309,6 +322,7 @@ fn encode_fetch(request: &FetchRequest, buffer: &mut BytesMut) -> Result<(), Pro
     buffer.put_u32(request.partition);
     buffer.put_u64(request.offset);
     buffer.put_u32(request.max_bytes);
+    buffer.put_u32(request.max_wait_ms);
     Ok(())
 }
 
@@ -447,6 +461,8 @@ pub enum ProtocolError {
     MessageTooLarge,
     #[error("fetch byte limit is zero or exceeds the configured limit")]
     FetchTooLarge,
+    #[error("fetch wait exceeds the configured limit")]
+    FetchWaitTooLong,
 }
 
 #[cfg(test)]
@@ -532,7 +548,8 @@ mod tests {
     #[test]
     fn round_trips_fetch_request() {
         let request = Request::Fetch(
-            FetchRequest::new("payments".to_owned(), 0, 42, 4096).expect("fetch should be valid"),
+            FetchRequest::new("payments".to_owned(), 0, 42, 4096, 5_000)
+                .expect("fetch should be valid"),
         );
         let mut buffer = BytesMut::new();
         encode_request(&request, &mut buffer).expect("request should encode");

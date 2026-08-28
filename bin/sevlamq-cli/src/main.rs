@@ -40,6 +40,9 @@ enum Command {
 
         #[arg(long, default_value_t = 1024 * 1024)]
         max_bytes: u32,
+
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u32,
     },
 }
 
@@ -63,8 +66,11 @@ async fn main() -> Result<(), CliError> {
             partition,
             offset,
             max_bytes,
+            wait_ms,
         } => {
-            let response = client.fetch(topic, partition, offset, max_bytes).await?;
+            let response = client
+                .fetch(topic, partition, offset, max_bytes, wait_ms)
+                .await?;
             for record in response.records() {
                 let key = record
                     .key
@@ -131,6 +137,7 @@ mod tests {
                 partition: 0,
                 offset: 0,
                 max_bytes: 1_048_576,
+                wait_ms: 0,
             } if topic == "payments"
         ));
     }

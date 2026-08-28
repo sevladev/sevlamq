@@ -58,8 +58,15 @@ impl Client {
         partition: u32,
         offset: u64,
         max_bytes: u32,
+        max_wait_ms: u32,
     ) -> Result<FetchResponse, ClientError> {
-        let request = Request::Fetch(FetchRequest::new(topic, partition, offset, max_bytes)?);
+        let request = Request::Fetch(FetchRequest::new(
+            topic,
+            partition,
+            offset,
+            max_bytes,
+            max_wait_ms,
+        )?);
         encode_request(&request, &mut self.write_buffer)?;
         self.stream.write_all(&self.write_buffer).await?;
         self.write_buffer.clear();

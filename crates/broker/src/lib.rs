@@ -2,8 +2,11 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -16,8 +19,9 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
+    time::{Instant, timeout_at},
 };
 use tracing::{debug, info, warn};
 
@@ -140,6 +144,7 @@ async fn handle_connection(
                             request.partition(),
                             request.offset(),
                             request.max_bytes(),
+                            request.max_wait_ms(),
                         )
                         .await?;
                     encode_response(
@@ -160,6 +165,7 @@ async fn handle_connection(
 #[derive(Clone)]
 struct StorageHandle {
     sender: mpsc::Sender<StorageCommand>,
+    new_records: Arc<Notify>,
 }
 
 impl StorageHandle {
@@ -179,10 +185,12 @@ impl StorageHandle {
             })
             .await
             .map_err(|_| ConnectionError::StorageUnavailable)?;
-        response
+        let ack = response
             .await
             .map_err(|_| ConnectionError::StorageUnavailable)?
-            .map_err(ConnectionError::Storage)
+            .map_err(ConnectionError::Storage)?;
+        self.new_records.notify_waiters();
+        Ok(ack)
     }
 
     async fn read(
@@ -191,11 +199,35 @@ impl StorageHandle {
         partition: u32,
         offset: u64,
         max_bytes: u32,
+        max_wait_ms: u32,
+    ) -> Result<Vec<FetchedRecord>, ConnectionError> {
+        let deadline = Instant::now() + Duration::from_millis(u64::from(max_wait_ms));
+
+        loop {
+            let notified = self.new_records.notified();
+            tokio::pin!(notified);
+            let _ = notified.as_mut().enable();
+            let records = self.read_once(&topic, partition, offset, max_bytes).await?;
+            if !records.is_empty() || max_wait_ms == 0 {
+                return Ok(records);
+            }
+            if timeout_at(deadline, notified).await.is_err() {
+                return Ok(records);
+            }
+        }
+    }
+
+    async fn read_once(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        max_bytes: u32,
     ) -> Result<Vec<FetchedRecord>, ConnectionError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .send(StorageCommand::Read {
-                topic,
+                topic: topic.to_owned(),
                 partition,
                 offset,
                 max_bytes,
@@ -260,6 +292,7 @@ async fn start_storage_worker(
     let (settings, mut logs) =
         tokio::task::spawn_blocking(move || recover_storage(settings)).await??;
     let (sender, mut receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
+    let new_records = Arc::new(Notify::new());
     let worker = tokio::task::spawn_blocking(move || {
         let mut round_robin = HashMap::<String, u32>::new();
         while let Some(command) = receiver.blocking_recv() {
@@ -289,7 +322,13 @@ async fn start_storage_worker(
         }
         Ok(())
     });
-    Ok((StorageHandle { sender }, worker))
+    Ok((
+        StorageHandle {
+            sender,
+            new_records,
+        },
+        worker,
+    ))
 }
 
 fn recover_storage(
@@ -541,6 +580,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wakes_long_poll_when_a_record_is_appended() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let (storage, storage_worker) =
+            start_storage_worker(data_dir.path().to_owned(), 1024, 64, 1)
+                .await
+                .expect("storage worker should start");
+        let waiting_storage = storage.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_storage
+                .read("payments".to_owned(), 0, 0, 1024, 1_000)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        storage
+            .append(
+                "payments".to_owned(),
+                Bytes::new(),
+                Bytes::from_static(b"hello"),
+            )
+            .await
+            .expect("append should wake waiting fetch");
+        let records = waiting
+            .await
+            .expect("fetch task should finish")
+            .expect("fetch should succeed");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset, 0);
+        assert_eq!(records[0].value, Bytes::from_static(b"hello"));
+        drop(storage);
+        storage_worker
+            .await
+            .expect("storage worker should finish")
+            .expect("storage should close cleanly");
+    }
+
+    #[tokio::test]
     async fn produces_and_fetches_persisted_records() {
         timeout(Duration::from_secs(2), async {
             let listener = TcpListener::bind("127.0.0.1:0")
@@ -598,6 +675,7 @@ mod tests {
                     selected_partition.expect("partition should be selected"),
                     1,
                     1024,
+                    0,
                 )
                 .await
                 .expect("broker should return records");
