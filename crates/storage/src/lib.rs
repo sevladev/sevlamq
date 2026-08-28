@@ -77,6 +77,24 @@ pub struct PartitionLog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionIdentity {
+    topic: String,
+    partition: u32,
+}
+
+impl PartitionIdentity {
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    #[must_use]
+    pub const fn partition(&self) -> u32 {
+        self.partition
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentMetadata {
     base_offset: u64,
     path: PathBuf,
@@ -307,6 +325,50 @@ impl PartitionLog {
         self.segments.push(segment);
         Ok(())
     }
+}
+
+pub fn discover_partitions(
+    data_dir: impl AsRef<Path>,
+) -> Result<Vec<PartitionIdentity>, StorageError> {
+    let data_dir = data_dir.as_ref();
+    fs::create_dir_all(data_dir)?;
+    let mut partitions = Vec::new();
+
+    for topic_entry in fs::read_dir(data_dir)? {
+        let topic_path = topic_entry?.path();
+        if !topic_path.is_dir() {
+            continue;
+        }
+        let topic = topic_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(StorageError::InvalidTopic)?;
+        validate_topic(topic)?;
+
+        for partition_entry in fs::read_dir(&topic_path)? {
+            let partition_path = partition_entry?.path();
+            if !partition_path.is_dir() {
+                continue;
+            }
+            let partition = partition_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(StorageError::InvalidPartitionName)?
+                .parse::<u32>()
+                .map_err(|_| StorageError::InvalidPartitionName)?;
+            partitions.push(PartitionIdentity {
+                topic: topic.to_owned(),
+                partition,
+            });
+        }
+    }
+
+    partitions.sort_unstable_by(|left, right| {
+        left.topic
+            .cmp(&right.topic)
+            .then(left.partition.cmp(&right.partition))
+    });
+    Ok(partitions)
 }
 
 fn recover_segment(
@@ -553,6 +615,8 @@ pub enum StorageError {
     MissingActiveSegment,
     #[error("segment filename is invalid")]
     InvalidSegmentName,
+    #[error("partition directory name is invalid")]
+    InvalidPartitionName,
     #[error("expected segment base offset {expected}, found {actual}")]
     UnexpectedSegmentBase { expected: u64, actual: u64 },
     #[error("closed segment at offset {0} has an incomplete tail")]

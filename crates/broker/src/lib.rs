@@ -11,7 +11,7 @@ use sevlamq_common::BrokerConfig;
 use sevlamq_protocol::{
     FetchResponse, FetchedRecord, ProduceAck, Request, Response, decode_request, encode_response,
 };
-use sevlamq_storage::{PartitionLog, Record};
+use sevlamq_storage::{PartitionLog, Record, discover_partitions};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -26,12 +26,13 @@ const STORAGE_QUEUE_CAPACITY: usize = 1024;
 
 pub async fn run(config: &BrokerConfig) -> Result<(), BrokerError> {
     let address = config.socket_addr()?;
-    let listener = TcpListener::bind(address).await?;
     let (storage, storage_worker) = start_storage_worker(
         PathBuf::from(&config.data_dir),
         config.max_segment_bytes,
         config.index_interval_bytes,
-    );
+    )
+    .await?;
+    let listener = TcpListener::bind(address).await?;
 
     info!(%address, data_dir = %config.data_dir, "broker started");
     accept_connections(&listener, storage.clone()).await?;
@@ -228,22 +229,29 @@ struct StorageSettings {
     index_interval_bytes: u64,
 }
 
-fn start_storage_worker(
+type PartitionKey = (String, u32);
+type PartitionLogs = HashMap<PartitionKey, PartitionLog>;
+
+async fn start_storage_worker(
     data_dir: PathBuf,
     max_segment_bytes: u64,
     index_interval_bytes: u64,
-) -> (
-    StorageHandle,
-    JoinHandle<Result<(), sevlamq_storage::StorageError>>,
-) {
-    let (sender, mut receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
+) -> Result<
+    (
+        StorageHandle,
+        JoinHandle<Result<(), sevlamq_storage::StorageError>>,
+    ),
+    BrokerError,
+> {
     let settings = StorageSettings {
         data_dir,
         max_segment_bytes,
         index_interval_bytes,
     };
+    let (settings, mut logs) =
+        tokio::task::spawn_blocking(move || recover_storage(settings)).await??;
+    let (sender, mut receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
     let worker = tokio::task::spawn_blocking(move || {
-        let mut logs = HashMap::<String, PartitionLog>::new();
         while let Some(command) = receiver.blocking_recv() {
             match command {
                 StorageCommand::Append {
@@ -270,19 +278,50 @@ fn start_storage_worker(
         }
         Ok(())
     });
-    (StorageHandle { sender }, worker)
+    Ok((StorageHandle { sender }, worker))
+}
+
+fn recover_storage(
+    settings: StorageSettings,
+) -> Result<(StorageSettings, PartitionLogs), sevlamq_storage::StorageError> {
+    let identities = discover_partitions(&settings.data_dir)?;
+    let mut logs = HashMap::with_capacity(identities.len());
+
+    for identity in identities {
+        let topic = identity.topic().to_owned();
+        let partition = identity.partition();
+        let log = PartitionLog::open(
+            &settings.data_dir,
+            &topic,
+            partition,
+            settings.max_segment_bytes,
+            settings.index_interval_bytes,
+        )?;
+        info!(
+            topic,
+            partition,
+            segments = log.segments().len(),
+            next_offset = log.next_offset(),
+            "partition recovered"
+        );
+        logs.insert((topic, partition), log);
+    }
+
+    info!(partitions = logs.len(), "storage recovery completed");
+    Ok((settings, logs))
 }
 
 fn append_record(
     settings: &StorageSettings,
-    logs: &mut HashMap<String, PartitionLog>,
+    logs: &mut PartitionLogs,
     topic: &str,
     key: Bytes,
     value: Bytes,
 ) -> Result<u64, sevlamq_storage::StorageError> {
-    if !logs.contains_key(topic) {
+    let partition_key = (topic.to_owned(), 0);
+    if !logs.contains_key(&partition_key) {
         logs.insert(
-            topic.to_owned(),
+            partition_key.clone(),
             PartitionLog::open(
                 &settings.data_dir,
                 topic,
@@ -293,7 +332,7 @@ fn append_record(
         );
     }
     let log = logs
-        .get_mut(topic)
+        .get_mut(&partition_key)
         .ok_or(sevlamq_storage::StorageError::InvalidTopic)?;
     let timestamp_ms = u64::try_from(
         SystemTime::now()
@@ -308,18 +347,19 @@ fn append_record(
 
 fn read_records(
     settings: &StorageSettings,
-    logs: &mut HashMap<String, PartitionLog>,
+    logs: &mut PartitionLogs,
     topic: &str,
     partition: u32,
     offset: u64,
     max_bytes: u32,
 ) -> Result<Vec<FetchedRecord>, sevlamq_storage::StorageError> {
-    if partition != 0 {
-        return Err(sevlamq_storage::StorageError::UnknownPartition(partition));
-    }
-    if !logs.contains_key(topic) {
+    let partition_key = (topic.to_owned(), partition);
+    if !logs.contains_key(&partition_key) {
+        if partition != 0 {
+            return Err(sevlamq_storage::StorageError::UnknownPartition(partition));
+        }
         logs.insert(
-            topic.to_owned(),
+            partition_key.clone(),
             PartitionLog::open(
                 &settings.data_dir,
                 topic,
@@ -330,7 +370,7 @@ fn read_records(
         );
     }
     let log = logs
-        .get(topic)
+        .get(&partition_key)
         .ok_or(sevlamq_storage::StorageError::InvalidTopic)?;
     let max_bytes =
         usize::try_from(max_bytes).map_err(|_| sevlamq_storage::StorageError::InvalidReadLimit)?;
@@ -389,14 +429,45 @@ enum ConnectionError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::time::Duration;
+    use std::{fs, time::Duration};
 
     use bytes::Bytes;
     use sevlamq_client::Client;
+    use sevlamq_storage::{PartitionLog, Record};
     use tempfile::tempdir;
     use tokio::{net::TcpListener, time::timeout};
 
     use super::{handle_connection, start_storage_worker};
+
+    #[tokio::test]
+    async fn recovers_existing_partitions_before_starting_worker() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let index_path = {
+            let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
+                .expect("partition log should be created");
+            log.append(&Record::new(None, Bytes::from_static(b"hello"), 1))
+                .expect("record should append");
+            log.flush().expect("record should flush");
+            log.active_path().with_extension("idx")
+        };
+        fs::write(&index_path, b"broken index").expect("index should be corrupted");
+
+        let (storage, storage_worker) = start_storage_worker(data_dir.path().to_owned(), 1024, 64)
+            .await
+            .expect("storage recovery should complete");
+
+        assert_eq!(
+            fs::metadata(index_path)
+                .expect("index metadata should exist")
+                .len(),
+            16
+        );
+        drop(storage);
+        storage_worker
+            .await
+            .expect("storage worker should finish")
+            .expect("storage should close cleanly");
+    }
 
     #[tokio::test]
     async fn produces_and_fetches_persisted_records() {
@@ -409,7 +480,9 @@ mod tests {
                 .expect("listener should have an address");
             let data_dir = tempdir().expect("temporary directory should be created");
             let (storage, storage_worker) =
-                start_storage_worker(data_dir.path().to_owned(), 1024, 64);
+                start_storage_worker(data_dir.path().to_owned(), 1024, 64)
+                    .await
+                    .expect("storage worker should start");
             let connection_storage = storage.clone();
             let server = tokio::spawn(async move {
                 let (stream, peer) = listener.accept().await.expect("connection should arrive");
