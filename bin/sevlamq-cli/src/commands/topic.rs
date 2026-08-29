@@ -20,5 +20,15 @@ pub(super) async fn execute(client: &mut Client, command: TopicCommand) -> Resul
 }
 
 fn print_topic(topic: &sevlamq_protocol::TopicMetadata) {
-    println!("topic={} partitions={}", topic.topic, topic.partitions);
+    let leaders = topic
+        .leaders
+        .iter()
+        .enumerate()
+        .map(|(partition, leader)| format!("{partition}:{leader}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "topic={} partitions={} leaders=[{}]",
+        topic.topic, topic.partitions, leaders
+    );
 }

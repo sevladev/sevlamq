@@ -82,7 +82,7 @@ impl Config {
     }
 
     pub fn cluster_nodes(&self) -> Result<Vec<ClusterNodeConfig>, ConfigError> {
-        let nodes = if self.cluster.nodes.is_empty() {
+        let mut nodes = if self.cluster.nodes.is_empty() {
             vec![ClusterNodeConfig {
                 id: self.cluster.broker_id,
                 host: self.broker.host.clone(),
@@ -113,6 +113,7 @@ impl Config {
         if !ids.contains(&self.cluster.broker_id) {
             return Err(ConfigError::LocalBrokerMissing);
         }
+        nodes.sort_unstable_by_key(|node| node.id);
         Ok(nodes)
     }
 }

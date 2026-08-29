@@ -219,10 +219,14 @@ async fn process_request(
 ) -> Result<Response, ConnectionError> {
     match request {
         Request::Produce(request) => {
+            if let Some(error) = leadership_error(cluster, request.partition()) {
+                return Ok(error);
+            }
             debug!(connection_id, %peer, topic = %request.topic(), "produce received");
             let ack = storage
                 .append(
                     request.topic().to_owned(),
+                    request.partition(),
                     request.key().clone(),
                     request.payload().clone(),
                     request.ack_mode(),
@@ -235,6 +239,9 @@ async fn process_request(
             Ok(Response::ProduceAck(ack))
         }
         Request::ProduceBatch(request) => {
+            if let Some(error) = leadership_error(cluster, request.partition()) {
+                return Ok(error);
+            }
             let response = produce_batch(storage, connection_id, peer, &request).await?;
             metrics.produced(
                 request.records().len(),
@@ -247,6 +254,9 @@ async fn process_request(
             Ok(response)
         }
         Request::Fetch(request) => {
+            if let Some(error) = leadership_error(cluster, Some(request.partition())) {
+                return Ok(error);
+            }
             let records = storage
                 .read(
                     request.topic().to_owned(),
@@ -263,6 +273,9 @@ async fn process_request(
             Ok(Response::Fetch(FetchResponse::new(records)))
         }
         Request::GroupFetch(request) => {
+            if let Some(error) = leadership_error(cluster, Some(request.partition)) {
+                return Ok(error);
+            }
             let response = group_fetch(storage, groups, request).await?;
             if let Response::Fetch(fetch) = &response {
                 metrics.fetched(
@@ -281,6 +294,22 @@ async fn process_request(
         | Request::LeaveGroup(_)
         | Request::CommitOffset(_)
         | Request::FetchCommittedOffset(_)) => Ok(groups.execute(request).await),
+        request @ (Request::CreateTopic(_)
+        | Request::ListTopics
+        | Request::DescribeTopic(_)
+        | Request::ClusterMetadata) => {
+            process_topic_request(request, storage, groups, cluster).await
+        }
+    }
+}
+
+async fn process_topic_request(
+    request: Request,
+    storage: &StorageHandle,
+    groups: &GroupHandle,
+    cluster: &ClusterMetadata,
+) -> Result<Response, ConnectionError> {
+    match request {
         Request::CreateTopic(request) => {
             let metadata = match storage
                 .create_topic(request.topic, request.partitions)
@@ -295,16 +324,54 @@ async fn process_request(
             groups
                 .set_topic_partitions(&metadata.topic, metadata.partitions)
                 .map_err(|_| ConnectionError::StorageUnavailable)?;
-            Ok(Response::Topics(vec![metadata]))
+            Ok(Response::Topics(vec![with_leaders(metadata, cluster)]))
         }
-        Request::ListTopics => storage.list_topics().await.map(Response::Topics),
+        Request::ListTopics => storage.list_topics().await.map(|topics| {
+            Response::Topics(
+                topics
+                    .into_iter()
+                    .map(|metadata| with_leaders(metadata, cluster))
+                    .collect(),
+            )
+        }),
         Request::DescribeTopic(topic) => match storage.describe_topic(topic).await {
-            Ok(metadata) => Ok(Response::Topics(vec![metadata])),
+            Ok(metadata) => Ok(Response::Topics(vec![with_leaders(metadata, cluster)])),
             Err(ConnectionError::Storage(error)) => Ok(Response::Error(error.to_string())),
             Err(error) => Err(error),
         },
         Request::ClusterMetadata => Ok(Response::ClusterMetadata(cluster.clone())),
+        _ => unreachable!("only topic and cluster requests are dispatched here"),
     }
+}
+
+fn with_leaders(mut metadata: TopicMetadata, cluster: &ClusterMetadata) -> TopicMetadata {
+    metadata.leaders = (0..metadata.partitions)
+        .map(|partition| leader_for_partition(cluster, partition).id)
+        .collect();
+    metadata
+}
+
+fn leadership_error(cluster: &ClusterMetadata, partition: Option<u32>) -> Option<Response> {
+    if cluster.nodes.len() == 1 {
+        return None;
+    }
+    let Some(partition) = partition else {
+        return Some(Response::Error(
+            "partition is required for clustered produce".to_owned(),
+        ));
+    };
+    let leader = leader_for_partition(cluster, partition);
+    (leader.id != cluster.responding_broker_id).then(|| {
+        Response::Error(format!(
+            "not partition leader: partition={partition} leader_id={} leader={}:{}",
+            leader.id, leader.host, leader.port
+        ))
+    })
+}
+
+fn leader_for_partition(cluster: &ClusterMetadata, partition: u32) -> &ClusterNode {
+    let index = usize::try_from(partition).map_or(0, |value| value % cluster.nodes.len());
+    &cluster.nodes[index]
 }
 
 struct ConnectionGuard(Arc<RuntimeMetrics>);
@@ -332,6 +399,7 @@ async fn produce_batch(
     storage
         .append_batch(
             request.topic().to_owned(),
+            request.partition(),
             request.records().to_vec(),
             request.ack_mode(),
         )
@@ -860,6 +928,7 @@ impl StorageHandle {
     async fn append(
         &self,
         topic: String,
+        partition: Option<u32>,
         key: Bytes,
         value: Bytes,
         ack_mode: AckMode,
@@ -868,6 +937,7 @@ impl StorageHandle {
         let (reply, response) = oneshot::channel();
         self.enqueue(StorageCommand::Append {
             topic,
+            partition,
             key,
             value,
             ack_mode,
@@ -886,12 +956,14 @@ impl StorageHandle {
     async fn append_batch(
         &self,
         topic: String,
+        partition: Option<u32>,
         records: Vec<BatchRecord>,
         ack_mode: AckMode,
     ) -> Result<Vec<ProduceAck>, ConnectionError> {
         let (reply, response) = oneshot::channel();
         self.enqueue(StorageCommand::AppendBatch {
             topic,
+            partition,
             records,
             ack_mode,
             reply,
@@ -963,6 +1035,7 @@ enum StorageCommand {
     },
     Append {
         topic: String,
+        partition: Option<u32>,
         key: Bytes,
         value: Bytes,
         ack_mode: AckMode,
@@ -971,6 +1044,7 @@ enum StorageCommand {
     },
     AppendBatch {
         topic: String,
+        partition: Option<u32>,
         records: Vec<BatchRecord>,
         ack_mode: AckMode,
         reply: oneshot::Sender<Result<Vec<ProduceAck>, sevlamq_storage::StorageError>>,
@@ -1002,6 +1076,7 @@ struct StorageSettings {
 
 struct AppendInput {
     topic: String,
+    partition: Option<u32>,
     key: Bytes,
     value: Bytes,
     ack_mode: AckMode,
@@ -1010,6 +1085,7 @@ struct AppendInput {
 
 struct BatchAppendInput {
     topic: String,
+    partition: Option<u32>,
     records: Vec<BatchRecord>,
     ack_mode: AckMode,
 }
@@ -1091,6 +1167,7 @@ fn run_storage_worker(
                     .map(|(topic, partitions)| TopicMetadata {
                         topic: topic.clone(),
                         partitions: *partitions,
+                        leaders: Vec::new(),
                     })
                     .collect();
                 metadata.sort_unstable_by(|left, right| left.topic.cmp(&right.topic));
@@ -1098,6 +1175,7 @@ fn run_storage_worker(
             }
             StorageCommand::Append {
                 topic,
+                partition,
                 key,
                 value,
                 ack_mode,
@@ -1106,6 +1184,7 @@ fn run_storage_worker(
             } => {
                 let input = AppendInput {
                     topic,
+                    partition,
                     key,
                     value,
                     ack_mode,
@@ -1117,6 +1196,7 @@ fn run_storage_worker(
             }
             StorageCommand::AppendBatch {
                 topic,
+                partition,
                 records,
                 ack_mode,
                 reply,
@@ -1128,6 +1208,7 @@ fn run_storage_worker(
                     &mut round_robin,
                     BatchAppendInput {
                         topic,
+                        partition,
                         records,
                         ack_mode,
                     },
@@ -1231,6 +1312,7 @@ fn append_record(
 ) -> Result<ProduceAck, sevlamq_storage::StorageError> {
     let AppendInput {
         topic,
+        partition,
         key,
         value,
         ack_mode,
@@ -1242,7 +1324,14 @@ fn append_record(
     } else {
         Some(key.as_ref())
     };
-    let partition = select_partition(partition_count, round_robin, &topic, routing_key);
+    let partition = if let Some(partition) = partition {
+        if partition >= partition_count {
+            return Err(sevlamq_storage::StorageError::UnknownPartition(partition));
+        }
+        partition
+    } else {
+        select_partition(partition_count, round_robin, &topic, routing_key)
+    };
     let partition_key = (topic, partition);
     let log = logs
         .get_mut(&partition_key)
@@ -1280,6 +1369,7 @@ fn append_batch_records(
 ) -> Result<Vec<ProduceAck>, sevlamq_storage::StorageError> {
     let BatchAppendInput {
         topic,
+        partition,
         records,
         ack_mode,
     } = input;
@@ -1292,6 +1382,7 @@ fn append_batch_records(
             round_robin,
             AppendInput {
                 topic: topic.clone(),
+                partition,
                 key: record.key,
                 value: record.payload,
                 ack_mode: AckMode::Leader,
@@ -1367,6 +1458,7 @@ fn create_topic(
     Ok(TopicMetadata {
         topic: topic.to_owned(),
         partitions,
+        leaders: Vec::new(),
     })
 }
 
@@ -1522,8 +1614,8 @@ mod tests {
 
     use super::{
         ConnectionError, GroupHandle, PartitionSnapshot, RuntimeMetrics, StorageCommand,
-        StorageHandle, StorageSettings, handle_connection, render_metrics, select_partition,
-        start_storage_worker,
+        StorageHandle, StorageSettings, handle_connection, leader_for_partition, leadership_error,
+        render_metrics, select_partition, start_storage_worker,
     };
 
     fn test_storage_settings(data_dir: &std::path::Path, partitions: u32) -> StorageSettings {
@@ -1551,6 +1643,36 @@ mod tests {
                 replication_port: 7500,
             }],
         })
+    }
+
+    fn three_node_cluster() -> ClusterMetadata {
+        ClusterMetadata {
+            responding_broker_id: 1,
+            nodes: (1..=3)
+                .map(|id| ClusterNode {
+                    id,
+                    host: "127.0.0.1".to_owned(),
+                    port: u16::try_from(7_300 + id * 100).expect("test port should fit"),
+                    admin_port: u16::try_from(7_301 + id * 100).expect("test port should fit"),
+                    replication_port: u16::try_from(7_302 + id * 100)
+                        .expect("test port should fit"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn assigns_partition_leaders_deterministically() {
+        let cluster = three_node_cluster();
+
+        let leaders: Vec<u32> = (0..6)
+            .map(|partition| leader_for_partition(&cluster, partition).id)
+            .collect();
+
+        assert_eq!(leaders, [1, 2, 3, 1, 2, 3]);
+        assert!(leadership_error(&cluster, Some(0)).is_none());
+        assert!(leadership_error(&cluster, Some(1)).is_some());
+        assert!(leadership_error(&cluster, None).is_some());
     }
 
     #[test]
@@ -1710,6 +1832,7 @@ mod tests {
         storage
             .append(
                 "payments".to_owned(),
+                None,
                 Bytes::new(),
                 Bytes::from_static(b"hello"),
                 AckMode::Durable,
@@ -1745,6 +1868,7 @@ mod tests {
         let acks = storage
             .append_batch(
                 "payments".to_owned(),
+                None,
                 vec![
                     BatchRecord {
                         key: Bytes::new(),

@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 bytes.workspace = true
+crc32fast.workspace = true
 sevlamq-protocol = { path = "../protocol" }
 thiserror.workspace = true
 tokio.workspace = true

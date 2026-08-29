@@ -77,6 +77,7 @@ pub struct CreateTopicRequest {
 pub struct TopicMetadata {
     pub topic: String,
     pub partitions: u32,
+    pub leaders: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +115,7 @@ pub struct ProduceBatchRequest {
     records: Vec<BatchRecord>,
     ack_mode: AckMode,
     compression: Compression,
+    partition: Option<u32>,
 }
 
 impl ProduceBatchRequest {
@@ -149,6 +151,7 @@ impl ProduceBatchRequest {
             records,
             ack_mode,
             compression,
+            partition: None,
         })
     }
 
@@ -170,6 +173,17 @@ impl ProduceBatchRequest {
     #[must_use]
     pub const fn compression(&self) -> Compression {
         self.compression
+    }
+
+    #[must_use]
+    pub const fn with_partition(mut self, partition: u32) -> Self {
+        self.partition = Some(partition);
+        self
+    }
+
+    #[must_use]
+    pub const fn partition(&self) -> Option<u32> {
+        self.partition
     }
 }
 
@@ -285,6 +299,7 @@ pub struct ProduceRequest {
     payload: Bytes,
     ack_mode: AckMode,
     producer: Option<ProducerIdentity>,
+    partition: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +355,7 @@ impl ProduceRequest {
             payload,
             ack_mode,
             producer,
+            partition: None,
         })
     }
 
@@ -366,6 +382,17 @@ impl ProduceRequest {
     #[must_use]
     pub const fn producer(&self) -> Option<&ProducerIdentity> {
         self.producer.as_ref()
+    }
+
+    #[must_use]
+    pub const fn with_partition(mut self, partition: u32) -> Self {
+        self.partition = Some(partition);
+        self
+    }
+
+    #[must_use]
+    pub const fn partition(&self) -> Option<u32> {
+        self.partition
     }
 }
 
@@ -587,8 +614,22 @@ pub fn encode_response(response: &Response, buffer: &mut BytesMut) -> Result<(),
             buffer.put_u8(TOPICS_RESPONSE);
             buffer.put_u32(u32::try_from(topics.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
             for topic in topics {
+                if topic.partitions == 0
+                    || (!topic.leaders.is_empty()
+                        && topic.leaders.len()
+                            != usize::try_from(topic.partitions)
+                                .map_err(|_| ProtocolError::InvalidPartitionCount)?)
+                {
+                    return Err(ProtocolError::InvalidPartitionCount);
+                }
                 encode_string(&topic.topic, buffer)?;
                 buffer.put_u32(topic.partitions);
+                buffer.put_u32(
+                    u32::try_from(topic.leaders.len()).map_err(|_| ProtocolError::FrameTooLarge)?,
+                );
+                for leader in &topic.leaders {
+                    buffer.put_u32(*leader);
+                }
             }
             set_frame_len(buffer, start)
         }
@@ -726,10 +767,28 @@ fn decode_topics_response(mut frame: BytesMut) -> Result<Vec<TopicMetadata>, Pro
     let mut topics = Vec::with_capacity(count);
     for _ in 0..count {
         let topic = decode_string(&mut frame)?;
-        ensure_remaining(&frame, 4)?;
+        ensure_remaining(&frame, 8)?;
+        let partitions = frame.get_u32();
+        let leader_count = read_u32_len(&mut frame)?;
+        if partitions == 0
+            || (leader_count != 0
+                && leader_count
+                    != usize::try_from(partitions)
+                        .map_err(|_| ProtocolError::InvalidPartitionCount)?)
+        {
+            return Err(ProtocolError::InvalidPartitionCount);
+        }
+        ensure_remaining(
+            &frame,
+            leader_count
+                .checked_mul(4)
+                .ok_or(ProtocolError::InvalidFrame)?,
+        )?;
+        let leaders = (0..leader_count).map(|_| frame.get_u32()).collect();
         topics.push(TopicMetadata {
             topic,
-            partitions: frame.get_u32(),
+            partitions,
+            leaders,
         });
     }
     ensure_empty(&frame)?;
@@ -801,11 +860,23 @@ fn decode_produce(mut frame: BytesMut) -> Result<ProduceRequest, ProtocolError> 
         })
     };
 
+    ensure_remaining(&frame, 5)?;
+    let has_partition = frame.get_u8();
+    let partition = frame.get_u32();
+    if has_partition > 1 {
+        return Err(ProtocolError::InvalidFrame);
+    }
+
     if frame.has_remaining() {
         return Err(ProtocolError::InvalidFrame);
     }
 
-    ProduceRequest::new(topic, key, payload, ack_mode, producer)
+    let request = ProduceRequest::new(topic, key, payload, ack_mode, producer)?;
+    Ok(if has_partition == 1 {
+        request.with_partition(partition)
+    } else {
+        request
+    })
 }
 
 fn decode_create_topic(mut frame: BytesMut) -> Result<CreateTopicRequest, ProtocolError> {
@@ -834,6 +905,12 @@ fn decode_produce_batch(mut frame: BytesMut) -> Result<ProduceBatchRequest, Prot
     }
     let encoded_len = read_u32_len(&mut frame)?;
     let encoded = read_bytes(&mut frame, encoded_len)?;
+    ensure_remaining(&frame, 5)?;
+    let has_partition = frame.get_u8();
+    let partition = frame.get_u32();
+    if has_partition > 1 {
+        return Err(ProtocolError::InvalidFrame);
+    }
     ensure_empty(&frame)?;
     let decoded = match compression {
         Compression::None => encoded.to_vec(),
@@ -844,7 +921,12 @@ fn decode_produce_batch(mut frame: BytesMut) -> Result<ProduceBatchRequest, Prot
         return Err(ProtocolError::InvalidCompressedBatch);
     }
     let records = decode_batch_records(BytesMut::from(decoded.as_slice()))?;
-    ProduceBatchRequest::new(topic, records, ack_mode, compression)
+    let request = ProduceBatchRequest::new(topic, records, ack_mode, compression)?;
+    Ok(if has_partition == 1 {
+        request.with_partition(partition)
+    } else {
+        request
+    })
 }
 
 fn decode_batch_records(mut encoded: BytesMut) -> Result<Vec<BatchRecord>, ProtocolError> {
@@ -904,7 +986,8 @@ fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(),
         + 1
         + 2
         + producer_len
-        + 8;
+        + 8
+        + 5;
     buffer.put_u32(u32::try_from(frame_len).map_err(|_| ProtocolError::FrameTooLarge)?);
     buffer.put_u8(PRODUCE);
     buffer.put_u16(u16::try_from(request.topic.len()).map_err(|_| ProtocolError::TopicTooLarge)?);
@@ -922,6 +1005,8 @@ fn encode_produce(request: &ProduceRequest, buffer: &mut BytesMut) -> Result<(),
     } else {
         buffer.put_u64(0);
     }
+    buffer.put_u8(u8::from(request.partition.is_some()));
+    buffer.put_u32(request.partition.unwrap_or_default());
     Ok(())
 }
 
@@ -970,6 +1055,8 @@ fn encode_produce_batch(
     buffer.put_u32(u32::try_from(records.len()).map_err(|_| ProtocolError::BatchTooLarge)?);
     buffer.put_u32(u32::try_from(encoded.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
     buffer.extend_from_slice(&encoded);
+    buffer.put_u8(u8::from(request.partition.is_some()));
+    buffer.put_u32(request.partition.unwrap_or_default());
     set_frame_len(buffer, start)?;
     let frame_len = buffer.len() - start - FRAME_HEADER_SIZE;
     validate_size(frame_len, MAX_FRAME_SIZE, ProtocolError::FrameTooLarge)
@@ -1399,7 +1486,8 @@ mod tests {
                     sequence: 0,
                 }),
             )
-            .expect("request should be valid"),
+            .expect("request should be valid")
+            .with_partition(2),
         )
     }
 
@@ -1434,7 +1522,8 @@ mod tests {
                 AckMode::Durable,
                 Compression::Zstd,
             )
-            .expect("batch should be valid"),
+            .expect("batch should be valid")
+            .with_partition(1),
         );
         let mut encoded = BytesMut::new();
         encode_request(&request, &mut encoded).expect("batch should encode");
@@ -1480,6 +1569,7 @@ mod tests {
         let response = Response::Topics(vec![TopicMetadata {
             topic: "payments".to_owned(),
             partitions: 6,
+            leaders: vec![1, 2, 3, 1, 2, 3],
         }]);
         let mut encoded = BytesMut::new();
         encode_response(&response, &mut encoded).expect("topics response should encode");
