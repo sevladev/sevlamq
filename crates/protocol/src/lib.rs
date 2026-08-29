@@ -34,6 +34,11 @@ const DESCRIBE_TOPIC: u8 = 0x32;
 const TOPICS_RESPONSE: u8 = 0x33;
 const CLUSTER_METADATA: u8 = 0x40;
 const CLUSTER_METADATA_RESPONSE: u8 = 0x41;
+const PROMOTE_LEADER: u8 = 0x42;
+const APPLY_LEADERSHIP: u8 = 0x43;
+const LEADERSHIP_CHANGED: u8 = 0x44;
+const PARTITION_STATUS: u8 = 0x45;
+const PARTITION_STATUS_RESPONSE: u8 = 0x46;
 const REPLICATE_RECORD: u8 = 0x50;
 const REPLICATE_ACK: u8 = 0x51;
 
@@ -52,6 +57,9 @@ pub enum Request {
     ListTopics,
     DescribeTopic(String),
     ClusterMetadata,
+    PromoteLeader(PromoteLeaderRequest),
+    ApplyLeadership(ApplyLeadershipRequest),
+    PartitionStatus(PartitionStatusRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +88,33 @@ pub struct TopicMetadata {
     pub topic: String,
     pub partitions: u32,
     pub leaders: Vec<u32>,
+    pub leader_epochs: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionLeadership {
+    pub partition: u32,
+    pub leader_id: u32,
+    pub leader_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromoteLeaderRequest {
+    pub topic: String,
+    pub partition: u32,
+    pub leader_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyLeadershipRequest {
+    pub topic: String,
+    pub leadership: PartitionLeadership,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionStatusRequest {
+    pub topic: String,
+    pub partition: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +126,8 @@ pub struct ReplicateRecord {
     pub key: Option<Bytes>,
     pub value: Bytes,
     pub durable: bool,
+    pub leader_id: u32,
+    pub leader_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +156,8 @@ pub fn encode_replicate_record(
     buffer.put_u64(record.offset);
     buffer.put_u64(record.timestamp_ms);
     buffer.put_u8(u8::from(record.durable));
+    buffer.put_u32(record.leader_id);
+    buffer.put_u64(record.leader_epoch);
     buffer.put_u16(u16::try_from(key_len).map_err(|_| ProtocolError::KeyTooLarge)?);
     if let Some(key) = &record.key {
         buffer.extend_from_slice(key);
@@ -138,7 +177,7 @@ pub fn decode_replicate_record(
         return Err(ProtocolError::InvalidFrame);
     }
     let topic = decode_string(&mut frame)?;
-    ensure_remaining(&frame, 4 + 8 + 8 + 1 + 2)?;
+    ensure_remaining(&frame, 4 + 8 + 8 + 1 + 4 + 8 + 2)?;
     let partition = frame.get_u32();
     let offset = frame.get_u64();
     let timestamp_ms = frame.get_u64();
@@ -146,6 +185,8 @@ pub fn decode_replicate_record(
     if durable > 1 {
         return Err(ProtocolError::InvalidFrame);
     }
+    let leader_id = frame.get_u32();
+    let leader_epoch = frame.get_u64();
     let key_len = read_u16_len(&mut frame)?;
     let key = read_bytes(&mut frame, key_len)?;
     let value_len = read_u32_len(&mut frame)?;
@@ -160,6 +201,8 @@ pub fn decode_replicate_record(
         key: (!key.is_empty()).then_some(key),
         value,
         durable: durable == 1,
+        leader_id,
+        leader_epoch,
     }))
 }
 
@@ -511,6 +554,8 @@ pub enum Response {
     CommittedOffset(Option<u64>),
     Topics(Vec<TopicMetadata>),
     ClusterMetadata(ClusterMetadata),
+    LeadershipChanged(PartitionLeadership),
+    PartitionStatus(u64),
     Error(String),
 }
 
@@ -650,6 +695,22 @@ pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, Protocol
             Ok(Some(Request::DescribeTopic(topic)))
         }
         CLUSTER_METADATA if !frame.has_remaining() => Ok(Some(Request::ClusterMetadata)),
+        PROMOTE_LEADER => {
+            decode_promote_leader(frame).map(|value| Some(Request::PromoteLeader(value)))
+        }
+        APPLY_LEADERSHIP => {
+            decode_apply_leadership(frame).map(|value| Some(Request::ApplyLeadership(value)))
+        }
+        PARTITION_STATUS => {
+            let topic = decode_string(&mut frame)?;
+            ensure_remaining(&frame, 4)?;
+            let partition = frame.get_u32();
+            ensure_empty(&frame)?;
+            Ok(Some(Request::PartitionStatus(PartitionStatusRequest {
+                topic,
+                partition,
+            })))
+        }
         value => Err(ProtocolError::UnknownOpcode(value)),
     }
 }
@@ -679,6 +740,28 @@ pub fn encode_request(request: &Request, buffer: &mut BytesMut) -> Result<(), Pr
             buffer.put_u32(1);
             buffer.put_u8(CLUSTER_METADATA);
             Ok(())
+        }
+        Request::PromoteLeader(request) => encode_leadership_request(
+            PROMOTE_LEADER,
+            &request.topic,
+            request.partition,
+            request.leader_id,
+            0,
+            buffer,
+        ),
+        Request::ApplyLeadership(request) => encode_leadership_request(
+            APPLY_LEADERSHIP,
+            &request.topic,
+            request.leadership.partition,
+            request.leadership.leader_id,
+            request.leadership.leader_epoch,
+            buffer,
+        ),
+        Request::PartitionStatus(request) => {
+            validate_topic(&request.topic)?;
+            let start = encode_string_request(PARTITION_STATUS, [&request.topic], buffer)?;
+            buffer.put_u32(request.partition);
+            set_frame_len(buffer, start)
         }
     }
 }
@@ -736,56 +819,35 @@ pub fn encode_response(response: &Response, buffer: &mut BytesMut) -> Result<(),
             buffer.put_u64(offset.unwrap_or_default());
             Ok(())
         }
-        Response::Topics(topics) => {
-            let start = buffer.len();
-            buffer.put_u32(0);
-            buffer.put_u8(TOPICS_RESPONSE);
-            buffer.put_u32(u32::try_from(topics.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
-            for topic in topics {
-                if topic.partitions == 0
-                    || (!topic.leaders.is_empty()
-                        && topic.leaders.len()
-                            != usize::try_from(topic.partitions)
-                                .map_err(|_| ProtocolError::InvalidPartitionCount)?)
-                {
-                    return Err(ProtocolError::InvalidPartitionCount);
-                }
-                encode_string(&topic.topic, buffer)?;
-                buffer.put_u32(topic.partitions);
-                buffer.put_u32(
-                    u32::try_from(topic.leaders.len()).map_err(|_| ProtocolError::FrameTooLarge)?,
-                );
-                for leader in &topic.leaders {
-                    buffer.put_u32(*leader);
-                }
-            }
-            set_frame_len(buffer, start)
+        Response::Topics(topics) => encode_topics_response(topics, buffer),
+        Response::ClusterMetadata(metadata) => encode_cluster_metadata(metadata, buffer),
+        Response::LeadershipChanged(leadership) => {
+            buffer.put_u32(1 + 4 + 4 + 8);
+            buffer.put_u8(LEADERSHIP_CHANGED);
+            buffer.put_u32(leadership.partition);
+            buffer.put_u32(leadership.leader_id);
+            buffer.put_u64(leadership.leader_epoch);
+            Ok(())
         }
-        Response::ClusterMetadata(metadata) => {
-            if metadata.nodes.is_empty() || metadata.nodes.len() > MAX_CLUSTER_NODES {
-                return Err(ProtocolError::InvalidClusterMetadata);
-            }
-            let start = buffer.len();
-            buffer.put_u32(0);
-            buffer.put_u8(CLUSTER_METADATA_RESPONSE);
-            buffer.put_u32(metadata.responding_broker_id);
-            buffer.put_u32(
-                u32::try_from(metadata.nodes.len()).map_err(|_| ProtocolError::FrameTooLarge)?,
-            );
-            for node in &metadata.nodes {
-                buffer.put_u32(node.id);
-                encode_string(&node.host, buffer)?;
-                buffer.put_u16(node.port);
-                buffer.put_u16(node.admin_port);
-                buffer.put_u16(node.replication_port);
-            }
-            set_frame_len(buffer, start)
+        Response::PartitionStatus(next_offset) => {
+            buffer.put_u32(1 + 8);
+            buffer.put_u8(PARTITION_STATUS_RESPONSE);
+            buffer.put_u64(*next_offset);
+            Ok(())
         }
         Response::Error(message) => encode_string_response(ERROR_RESPONSE, message, buffer),
     }
 }
 
 pub fn decode_response(buffer: &mut BytesMut) -> Result<Option<Response>, ProtocolError> {
+    let Some(mut frame) = take_response_frame(buffer)? else {
+        return Ok(None);
+    };
+    let opcode = frame.get_u8();
+    decode_response_frame(opcode, frame)
+}
+
+fn take_response_frame(buffer: &mut BytesMut) -> Result<Option<BytesMut>, ProtocolError> {
     if buffer.len() < FRAME_HEADER_SIZE {
         return Ok(None);
     }
@@ -808,8 +870,67 @@ pub fn decode_response(buffer: &mut BytesMut) -> Result<Option<Response>, Protoc
     }
 
     buffer.advance(FRAME_HEADER_SIZE);
-    let mut frame = buffer.split_to(frame_len);
-    let opcode = frame.get_u8();
+    Ok(Some(buffer.split_to(frame_len)))
+}
+
+fn encode_topics_response(
+    topics: &[TopicMetadata],
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    let start = buffer.len();
+    buffer.put_u32(0);
+    buffer.put_u8(TOPICS_RESPONSE);
+    buffer.put_u32(u32::try_from(topics.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
+    for topic in topics {
+        if topic.partitions == 0
+            || (!topic.leaders.is_empty()
+                && topic.leaders.len()
+                    != usize::try_from(topic.partitions)
+                        .map_err(|_| ProtocolError::InvalidPartitionCount)?)
+            || topic.leader_epochs.len() != topic.leaders.len()
+        {
+            return Err(ProtocolError::InvalidPartitionCount);
+        }
+        encode_string(&topic.topic, buffer)?;
+        buffer.put_u32(topic.partitions);
+        buffer
+            .put_u32(u32::try_from(topic.leaders.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
+        for leader in &topic.leaders {
+            buffer.put_u32(*leader);
+        }
+        for epoch in &topic.leader_epochs {
+            buffer.put_u64(*epoch);
+        }
+    }
+    set_frame_len(buffer, start)
+}
+
+fn encode_cluster_metadata(
+    metadata: &ClusterMetadata,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    if metadata.nodes.is_empty() || metadata.nodes.len() > MAX_CLUSTER_NODES {
+        return Err(ProtocolError::InvalidClusterMetadata);
+    }
+    let start = buffer.len();
+    buffer.put_u32(0);
+    buffer.put_u8(CLUSTER_METADATA_RESPONSE);
+    buffer.put_u32(metadata.responding_broker_id);
+    buffer.put_u32(u32::try_from(metadata.nodes.len()).map_err(|_| ProtocolError::FrameTooLarge)?);
+    for node in &metadata.nodes {
+        buffer.put_u32(node.id);
+        encode_string(&node.host, buffer)?;
+        buffer.put_u16(node.port);
+        buffer.put_u16(node.admin_port);
+        buffer.put_u16(node.replication_port);
+    }
+    set_frame_len(buffer, start)
+}
+
+fn decode_response_frame(
+    opcode: u8,
+    mut frame: BytesMut,
+) -> Result<Option<Response>, ProtocolError> {
     match opcode {
         PRODUCE_ACK => {
             if frame.remaining() != size_of::<u32>() + size_of::<u64>() {
@@ -880,6 +1001,16 @@ pub fn decode_response(buffer: &mut BytesMut) -> Result<Option<Response>, Protoc
         CLUSTER_METADATA_RESPONSE => {
             decode_cluster_metadata(frame).map(|metadata| Some(Response::ClusterMetadata(metadata)))
         }
+        LEADERSHIP_CHANGED if frame.remaining() == 16 => {
+            Ok(Some(Response::LeadershipChanged(PartitionLeadership {
+                partition: frame.get_u32(),
+                leader_id: frame.get_u32(),
+                leader_epoch: frame.get_u64(),
+            })))
+        }
+        PARTITION_STATUS_RESPONSE if frame.remaining() == 8 => {
+            Ok(Some(Response::PartitionStatus(frame.get_u64())))
+        }
         ERROR_RESPONSE => {
             let message = decode_string(&mut frame)?;
             ensure_empty(&frame)?;
@@ -913,10 +1044,18 @@ fn decode_topics_response(mut frame: BytesMut) -> Result<Vec<TopicMetadata>, Pro
                 .ok_or(ProtocolError::InvalidFrame)?,
         )?;
         let leaders = (0..leader_count).map(|_| frame.get_u32()).collect();
+        ensure_remaining(
+            &frame,
+            leader_count
+                .checked_mul(8)
+                .ok_or(ProtocolError::InvalidFrame)?,
+        )?;
+        let leader_epochs = (0..leader_count).map(|_| frame.get_u64()).collect();
         topics.push(TopicMetadata {
             topic,
             partitions,
             leaders,
+            leader_epochs,
         });
     }
     ensure_empty(&frame)?;
@@ -1017,6 +1156,33 @@ fn decode_create_topic(mut frame: BytesMut) -> Result<CreateTopicRequest, Protoc
         return Err(ProtocolError::InvalidPartitionCount);
     }
     Ok(CreateTopicRequest { topic, partitions })
+}
+
+fn decode_promote_leader(mut frame: BytesMut) -> Result<PromoteLeaderRequest, ProtocolError> {
+    let topic = decode_string(&mut frame)?;
+    ensure_remaining(&frame, 8)?;
+    let request = PromoteLeaderRequest {
+        topic,
+        partition: frame.get_u32(),
+        leader_id: frame.get_u32(),
+    };
+    ensure_empty(&frame)?;
+    Ok(request)
+}
+
+fn decode_apply_leadership(mut frame: BytesMut) -> Result<ApplyLeadershipRequest, ProtocolError> {
+    let topic = decode_string(&mut frame)?;
+    ensure_remaining(&frame, 16)?;
+    let request = ApplyLeadershipRequest {
+        topic,
+        leadership: PartitionLeadership {
+            partition: frame.get_u32(),
+            leader_id: frame.get_u32(),
+            leader_epoch: frame.get_u64(),
+        },
+    };
+    ensure_empty(&frame)?;
+    Ok(request)
 }
 
 fn decode_produce_batch(mut frame: BytesMut) -> Result<ProduceBatchRequest, ProtocolError> {
@@ -1148,6 +1314,27 @@ fn encode_create_topic(
     }
     let start = encode_string_request(CREATE_TOPIC, [&request.topic], buffer)?;
     buffer.put_u32(request.partitions);
+    set_frame_len(buffer, start)
+}
+
+fn encode_leadership_request(
+    opcode: u8,
+    topic: &str,
+    partition: u32,
+    leader_id: u32,
+    leader_epoch: u64,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    validate_topic(topic)?;
+    let start = buffer.len();
+    buffer.put_u32(0);
+    buffer.put_u8(opcode);
+    encode_string(topic, buffer)?;
+    buffer.put_u32(partition);
+    buffer.put_u32(leader_id);
+    if opcode == APPLY_LEADERSHIP {
+        buffer.put_u64(leader_epoch);
+    }
     set_frame_len(buffer, start)
 }
 
@@ -1597,11 +1784,11 @@ mod tests {
 
     use super::{
         AckMode, BatchRecord, ClusterMetadata, ClusterNode, Compression, CreateTopicRequest,
-        FetchRequest, FetchResponse, FetchedRecord, MAX_FRAME_SIZE, ProduceBatchRequest,
-        ProduceRequest, ProtocolError, ReplicateAck, ReplicateRecord, Request, Response,
-        TopicMetadata, decode_replicate_ack, decode_replicate_record, decode_request,
-        decode_response, encode_replicate_ack, encode_replicate_record, encode_request,
-        encode_response,
+        FetchRequest, FetchResponse, FetchedRecord, MAX_FRAME_SIZE, PartitionLeadership,
+        PartitionStatusRequest, ProduceBatchRequest, ProduceRequest, PromoteLeaderRequest,
+        ProtocolError, ReplicateAck, ReplicateRecord, Request, Response, TopicMetadata,
+        decode_replicate_ack, decode_replicate_record, decode_request, decode_response,
+        encode_replicate_ack, encode_replicate_record, encode_request, encode_response,
     };
 
     fn produce_request() -> Request {
@@ -1700,6 +1887,7 @@ mod tests {
             topic: "payments".to_owned(),
             partitions: 6,
             leaders: vec![1, 2, 3, 1, 2, 3],
+            leader_epochs: vec![0, 0, 0, 0, 0, 0],
         }]);
         let mut encoded = BytesMut::new();
         encode_response(&response, &mut encoded).expect("topics response should encode");
@@ -1737,6 +1925,48 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_leadership_management_frames() {
+        let leadership = PartitionLeadership {
+            partition: 2,
+            leader_id: 3,
+            leader_epoch: 9,
+        };
+        for request in [
+            Request::PromoteLeader(PromoteLeaderRequest {
+                topic: "payments".to_owned(),
+                partition: 2,
+                leader_id: 3,
+            }),
+            Request::ApplyLeadership(super::ApplyLeadershipRequest {
+                topic: "payments".to_owned(),
+                leadership,
+            }),
+            Request::PartitionStatus(PartitionStatusRequest {
+                topic: "payments".to_owned(),
+                partition: 2,
+            }),
+        ] {
+            let mut encoded = BytesMut::new();
+            encode_request(&request, &mut encoded).expect("leadership request should encode");
+            assert_eq!(
+                decode_request(&mut encoded).expect("leadership request should decode"),
+                Some(request)
+            );
+        }
+        for response in [
+            Response::LeadershipChanged(leadership),
+            Response::PartitionStatus(42),
+        ] {
+            let mut encoded = BytesMut::new();
+            encode_response(&response, &mut encoded).expect("leadership response should encode");
+            assert_eq!(
+                decode_response(&mut encoded).expect("leadership response should decode"),
+                Some(response)
+            );
+        }
+    }
+
+    #[test]
     fn round_trips_replication_frames() {
         let record = ReplicateRecord {
             topic: "payments".to_owned(),
@@ -1746,6 +1976,8 @@ mod tests {
             key: Some(Bytes::from_static(b"customer-123")),
             value: Bytes::from_static(b"hello"),
             durable: true,
+            leader_id: 2,
+            leader_epoch: 7,
         };
         let mut buffer = BytesMut::new();
         encode_replicate_record(&record, &mut buffer).expect("replication record should encode");

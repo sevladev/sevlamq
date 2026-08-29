@@ -183,6 +183,14 @@ pub enum TopicCommand {
 #[derive(Debug, Subcommand)]
 pub enum ClusterCommand {
     Status,
+    /// Promotes an in-sync replica through the static controller.
+    Promote {
+        topic: String,
+        #[arg(long)]
+        partition: u32,
+        #[arg(long = "broker-id")]
+        broker_id: u32,
+    },
 }
 
 #[cfg(test)]
@@ -279,6 +287,31 @@ mod tests {
             Command::Cluster {
                 command: ClusterCommand::Status
             }
+        ));
+    }
+
+    #[test]
+    fn parses_manual_leader_promotion() {
+        let cli = Cli::try_parse_from([
+            "sevlamq",
+            "cluster",
+            "promote",
+            "payments",
+            "--partition",
+            "1",
+            "--broker-id",
+            "3",
+        ])
+        .expect("cluster promotion should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Cluster {
+                command: ClusterCommand::Promote {
+                    topic,
+                    partition: 1,
+                    broker_id: 3,
+                }
+            } if topic == "payments"
         ));
     }
 

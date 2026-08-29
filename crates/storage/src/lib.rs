@@ -334,6 +334,47 @@ impl PartitionLog {
         self.append(record)
     }
 
+    pub fn truncate_to(&mut self, offset: u64) -> Result<(), StorageError> {
+        if offset > self.next_offset {
+            return Err(StorageError::UnexpectedOffset {
+                expected: self.next_offset,
+                actual: offset,
+            });
+        }
+        if offset == self.next_offset {
+            return Ok(());
+        }
+        let retained: Vec<_> = self
+            .read(0, usize::MAX)?
+            .into_iter()
+            .filter(|record| record.offset < offset)
+            .collect();
+        for segment in &self.segments {
+            fs::remove_file(index_path(&segment.path))?;
+            fs::remove_file(&segment.path)?;
+        }
+        let segment = create_segment(&self.partition_dir, 0)?;
+        self.active_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&segment.path)?;
+        self.active_index_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(index_path(&segment.path))?;
+        self.segments = vec![segment];
+        self.next_offset = 0;
+        self.producer_state.clear();
+        for stored in retained {
+            let mut record = Record::new(stored.key, stored.value, stored.timestamp_ms);
+            if let Some(producer) = stored.producer {
+                record = record.with_producer(producer);
+            }
+            self.append(&record)?;
+        }
+        self.sync_data()
+    }
+
     pub fn flush(&mut self) -> Result<(), StorageError> {
         self.active_file.flush()?;
         self.active_index_file.flush()?;
@@ -977,6 +1018,30 @@ mod tests {
             log.append_replica(0, &divergent),
             Err(StorageError::ReplicaDiverged(0))
         ));
+    }
+
+    #[test]
+    fn truncates_a_divergent_tail_and_continues_at_that_offset() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
+            .expect("partition log should be created");
+        for value in [&b"first"[..], &b"second"[..], &b"divergent"[..]] {
+            log.append(&Record::new(None, Bytes::copy_from_slice(value), 1))
+                .expect("append should work");
+        }
+
+        log.truncate_to(2).expect("tail should be truncated");
+
+        assert_eq!(log.next_offset(), 2);
+        let retained = log.read(0, 1024).expect("records should be readable");
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].value, Bytes::from_static(b"first"));
+        assert_eq!(retained[1].value, Bytes::from_static(b"second"));
+        assert_eq!(
+            log.append(&Record::new(None, Bytes::from_static(b"replacement"), 2))
+                .expect("replacement should use the truncated offset"),
+            2
+        );
     }
 
     #[test]

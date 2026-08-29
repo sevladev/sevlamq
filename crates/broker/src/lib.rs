@@ -27,14 +27,16 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Notify, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
-    time::{Instant, timeout_at},
+    time::{Instant, sleep, timeout, timeout_at},
 };
 use tracing::{debug, info, warn};
 
 mod groups;
+mod leadership;
 mod observability;
 
 use groups::{GroupCoordinator, GroupIdentity};
+use leadership::LeadershipRegistry;
 use observability::RuntimeMetrics;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -83,14 +85,18 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
     let replication_address: SocketAddr =
         format!("{}:{}", local_node.host, local_node.replication_port).parse()?;
     let replication_listener = TcpListener::bind(replication_address).await?;
+    let leadership =
+        LeadershipRegistry::open(Path::new(&broker_config.data_dir), Arc::clone(&cluster))?;
     let cluster_runtime = ClusterRuntime {
         replicator: Replicator::new(
             Arc::clone(&cluster),
             Arc::clone(&metrics),
+            leadership.clone(),
             config.cluster.replication_factor,
             config.cluster.min_in_sync_replicas,
         ),
         metadata: Arc::clone(&cluster),
+        leadership: leadership.clone(),
     };
     let groups = GroupHandle::open(
         Path::new(&broker_config.data_dir),
@@ -102,8 +108,11 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
         .await
         .map_err(|_| BrokerError::StorageUnavailable)?
     {
+        leadership.ensure_topic(&topic.topic, topic.partitions)?;
         groups.set_topic_partitions(&topic.topic, topic.partitions)?;
     }
+
+    initial_controller_sync(&storage, &cluster, &leadership).await?;
 
     info!(broker_id = cluster.responding_broker_id, %address, %admin_address, %replication_address, data_dir = %broker_config.data_dir, "broker started");
     let recovery_worker = start_follower_recovery(
@@ -111,6 +120,7 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
         Arc::clone(&cluster_runtime.metadata),
         Arc::clone(&metrics),
         config.cluster.replication_factor,
+        leadership,
     );
     let accept_result = accept_connections(
         &listener,
@@ -162,7 +172,7 @@ async fn accept_connections(
             }
             accepted = replication_listener.accept() => {
                 let (stream, peer) = accepted?;
-                connections.spawn(handle_replication_connection(stream, peer, storage.clone(), Arc::clone(&metrics)));
+                connections.spawn(handle_replication_connection(stream, peer, storage.clone(), Arc::clone(&metrics), cluster.leadership.clone()));
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 report_connection_result(result);
@@ -228,6 +238,13 @@ async fn handle_connection(
                 Err(error @ ConnectionError::NotEnoughInSyncReplicas { .. }) => {
                     Response::Error(error.to_string())
                 }
+                Err(
+                    error @ (ConnectionError::PromotionCandidateUnavailable
+                    | ConnectionError::UnsafePromotion { .. }
+                    | ConnectionError::LeaderEpochOverflow
+                    | ConnectionError::StaleLeaderEpoch
+                    | ConnectionError::Leadership(_)),
+                ) => Response::Error(error.to_string()),
                 Err(error) => return Err(error),
             };
             match operation {
@@ -256,38 +273,12 @@ async fn process_request(
 ) -> Result<Response, ConnectionError> {
     match request {
         Request::Produce(request) => {
-            if let Some(error) = leadership_error(&cluster.metadata, request.partition()) {
-                return Ok(error);
-            }
-            debug!(connection_id, %peer, topic = %request.topic(), "produce received");
-            let ack = storage
-                .append(
-                    request.topic().to_owned(),
-                    request.partition(),
-                    request.key().clone(),
-                    request.payload().clone(),
-                    request.ack_mode(),
-                    request.producer().map(|producer| {
-                        StorageProducerIdentity::new(producer.id.clone(), producer.sequence)
-                    }),
-                )
-                .await?;
-            let record = storage
-                .record_at(request.topic(), ack.partition, ack.offset)
-                .await?;
-            dispatch_replication(
-                storage.clone(),
-                cluster.replicator.clone(),
-                request.topic().to_owned(),
-                vec![(ack.partition, record)],
-                request.ack_mode(),
-            )
-            .await?;
-            metrics.produced(1, request.payload().len());
-            Ok(Response::ProduceAck(ack))
+            process_produce(request, storage, metrics, connection_id, peer, cluster).await
         }
         Request::ProduceBatch(request) => {
-            if let Some(error) = leadership_error(&cluster.metadata, request.partition()) {
+            if let Some(error) =
+                cluster_leadership_error(cluster, request.topic(), request.partition())?
+            {
                 return Ok(error);
             }
             let response =
@@ -303,7 +294,9 @@ async fn process_request(
             Ok(response)
         }
         Request::Fetch(request) => {
-            if let Some(error) = leadership_error(&cluster.metadata, Some(request.partition())) {
+            if let Some(error) =
+                cluster_leadership_error(cluster, request.topic(), Some(request.partition()))?
+            {
                 return Ok(error);
             }
             let records = storage
@@ -322,7 +315,9 @@ async fn process_request(
             Ok(Response::Fetch(FetchResponse::new(records)))
         }
         Request::GroupFetch(request) => {
-            if let Some(error) = leadership_error(&cluster.metadata, Some(request.partition)) {
+            if let Some(error) =
+                cluster_leadership_error(cluster, &request.topic, Some(request.partition))?
+            {
                 return Ok(error);
             }
             let response = group_fetch(storage, groups, request).await?;
@@ -346,17 +341,59 @@ async fn process_request(
         request @ (Request::CreateTopic(_)
         | Request::ListTopics
         | Request::DescribeTopic(_)
-        | Request::ClusterMetadata) => {
-            process_topic_request(request, storage, groups, &cluster.metadata).await
+        | Request::ClusterMetadata
+        | Request::PromoteLeader(_)
+        | Request::ApplyLeadership(_)
+        | Request::PartitionStatus(_)) => {
+            process_topic_request(request, storage, groups, cluster).await
         }
     }
+}
+
+async fn process_produce(
+    request: sevlamq_protocol::ProduceRequest,
+    storage: &StorageHandle,
+    metrics: &RuntimeMetrics,
+    connection_id: u64,
+    peer: SocketAddr,
+    cluster: &ClusterRuntime,
+) -> Result<Response, ConnectionError> {
+    if let Some(error) = cluster_leadership_error(cluster, request.topic(), request.partition())? {
+        return Ok(error);
+    }
+    debug!(connection_id, %peer, topic = %request.topic(), "produce received");
+    let ack = storage
+        .append(
+            request.topic().to_owned(),
+            request.partition(),
+            request.key().clone(),
+            request.payload().clone(),
+            request.ack_mode(),
+            request.producer().map(|producer| {
+                StorageProducerIdentity::new(producer.id.clone(), producer.sequence)
+            }),
+        )
+        .await?;
+    let record = storage
+        .record_at(request.topic(), ack.partition, ack.offset)
+        .await?;
+    dispatch_replication(
+        storage.clone(),
+        cluster.replicator.clone(),
+        request.topic().to_owned(),
+        vec![(ack.partition, record)],
+        request.ack_mode(),
+    )
+    .await?;
+    metrics.produced(1, request.payload().len());
+    Ok(Response::ProduceAck(ack))
 }
 
 async fn process_topic_request(
     request: Request,
     storage: &StorageHandle,
     groups: &GroupHandle,
-    cluster: &ClusterMetadata,
+    cluster: &ClusterRuntime,
 ) -> Result<Response, ConnectionError> {
     match request {
         Request::CreateTopic(request) => {
@@ -373,33 +410,200 @@ async fn process_topic_request(
             groups
                 .set_topic_partitions(&metadata.topic, metadata.partitions)
                 .map_err(|_| ConnectionError::StorageUnavailable)?;
-            Ok(Response::Topics(vec![with_leaders(metadata, cluster)]))
+            cluster
+                .leadership
+                .ensure_topic(&metadata.topic, metadata.partitions)?;
+            if cluster
+                .metadata
+                .nodes
+                .first()
+                .is_some_and(|node| node.id == cluster.metadata.responding_broker_id)
+            {
+                broadcast_topic(&metadata.topic, metadata.partitions, cluster).await;
+            }
+            Ok(Response::Topics(vec![with_leaders(metadata, cluster)?]))
         }
-        Request::ListTopics => storage.list_topics().await.map(|topics| {
-            Response::Topics(
-                topics
-                    .into_iter()
-                    .map(|metadata| with_leaders(metadata, cluster))
-                    .collect(),
-            )
-        }),
+        Request::ListTopics => Ok(Response::Topics(
+            storage
+                .list_topics()
+                .await?
+                .into_iter()
+                .map(|metadata| with_leaders(metadata, cluster))
+                .collect::<Result<_, _>>()?,
+        )),
         Request::DescribeTopic(topic) => match storage.describe_topic(topic).await {
-            Ok(metadata) => Ok(Response::Topics(vec![with_leaders(metadata, cluster)])),
+            Ok(metadata) => Ok(Response::Topics(vec![with_leaders(metadata, cluster)?])),
             Err(ConnectionError::Storage(error)) => Ok(Response::Error(error.to_string())),
             Err(error) => Err(error),
         },
-        Request::ClusterMetadata => Ok(Response::ClusterMetadata(cluster.clone())),
+        Request::ClusterMetadata => Ok(Response::ClusterMetadata((*cluster.metadata).clone())),
+        Request::PartitionStatus(request) => storage
+            .partition_offset(&request.topic, request.partition)
+            .await
+            .map(Response::PartitionStatus),
+        Request::ApplyLeadership(request) => {
+            cluster
+                .leadership
+                .apply(&request.topic, request.leadership)?;
+            Ok(Response::LeadershipChanged(request.leadership))
+        }
+        Request::PromoteLeader(request) => promote_leader(request, storage, cluster).await,
         _ => unreachable!("only topic and cluster requests are dispatched here"),
     }
 }
 
-fn with_leaders(mut metadata: TopicMetadata, cluster: &ClusterMetadata) -> TopicMetadata {
-    metadata.leaders = (0..metadata.partitions)
-        .map(|partition| leader_for_partition(cluster, partition).id)
-        .collect();
-    metadata
+async fn broadcast_topic(topic: &str, partitions: u32, cluster: &ClusterRuntime) {
+    for node in &cluster.metadata.nodes {
+        if node.id == cluster.metadata.responding_broker_id {
+            continue;
+        }
+        let Ok(address) = format!("{}:{}", node.host, node.port).parse() else {
+            continue;
+        };
+        let Ok(mut client) = Client::connect(address).await else {
+            continue;
+        };
+        if let Err(error) = client
+            .apply_topic(address, topic.to_owned(), partitions)
+            .await
+        {
+            debug!(%error, broker_id = node.id, %topic, "topic broadcast deferred");
+        }
+    }
 }
 
+async fn promote_leader(
+    request: sevlamq_protocol::PromoteLeaderRequest,
+    storage: &StorageHandle,
+    cluster: &ClusterRuntime,
+) -> Result<Response, ConnectionError> {
+    let controller = cluster
+        .metadata
+        .nodes
+        .first()
+        .ok_or(ConnectionError::InvalidClusterMetadata)?;
+    if controller.id != cluster.metadata.responding_broker_id {
+        return Ok(Response::Error(format!(
+            "not controller: controller_id={} controller={}:{}",
+            controller.id, controller.host, controller.port
+        )));
+    }
+    let current = cluster
+        .leadership
+        .partition(&request.topic, request.partition)?;
+    if !is_partition_replica(
+        &cluster.metadata,
+        request.leader_id,
+        request.partition,
+        cluster.replicator.replication_factor,
+    ) {
+        return Ok(Response::Error(
+            "candidate is not a partition replica".to_owned(),
+        ));
+    }
+    verify_promotion_candidate(&request, storage, cluster).await?;
+    let leadership = sevlamq_protocol::PartitionLeadership {
+        partition: request.partition,
+        leader_id: request.leader_id,
+        leader_epoch: current
+            .leader_epoch
+            .checked_add(1)
+            .ok_or(ConnectionError::LeaderEpochOverflow)?,
+    };
+    cluster.leadership.apply(&request.topic, leadership)?;
+    broadcast_leadership(&request.topic, leadership, cluster).await;
+    Ok(Response::LeadershipChanged(leadership))
+}
+
+async fn verify_promotion_candidate(
+    request: &sevlamq_protocol::PromoteLeaderRequest,
+    storage: &StorageHandle,
+    cluster: &ClusterRuntime,
+) -> Result<(), ConnectionError> {
+    let mut offsets = Vec::new();
+    for node in &cluster.metadata.nodes {
+        if !is_partition_replica(
+            &cluster.metadata,
+            node.id,
+            request.partition,
+            cluster.replicator.replication_factor,
+        ) {
+            continue;
+        }
+        let offset = if node.id == cluster.metadata.responding_broker_id {
+            storage
+                .partition_offset(&request.topic, request.partition)
+                .await
+                .ok()
+        } else {
+            query_partition_offset(node, &request.topic, request.partition).await
+        };
+        if let Some(offset) = offset {
+            offsets.push((node.id, offset));
+        }
+    }
+    let candidate = offsets
+        .iter()
+        .find(|(id, _)| *id == request.leader_id)
+        .map(|(_, offset)| *offset)
+        .ok_or(ConnectionError::PromotionCandidateUnavailable)?;
+    let highest = offsets.iter().map(|(_, offset)| *offset).max().unwrap_or(0);
+    if offsets.len() < cluster.replicator.min_in_sync_replicas || candidate != highest {
+        return Err(ConnectionError::UnsafePromotion {
+            candidate,
+            highest,
+            available: offsets.len(),
+        });
+    }
+    Ok(())
+}
+
+async fn query_partition_offset(node: &ClusterNode, topic: &str, partition: u32) -> Option<u64> {
+    let address = format!("{}:{}", node.host, node.port).parse().ok()?;
+    let mut client = Client::connect(address).await.ok()?;
+    client
+        .partition_status(address, topic.to_owned(), partition)
+        .await
+        .ok()
+}
+
+async fn broadcast_leadership(
+    topic: &str,
+    leadership: sevlamq_protocol::PartitionLeadership,
+    cluster: &ClusterRuntime,
+) {
+    for node in &cluster.metadata.nodes {
+        if node.id == cluster.metadata.responding_broker_id {
+            continue;
+        }
+        let Ok(address) = format!("{}:{}", node.host, node.port).parse() else {
+            continue;
+        };
+        let Ok(mut client) = Client::connect(address).await else {
+            continue;
+        };
+        if let Err(error) = client
+            .apply_leadership(address, topic.to_owned(), leadership)
+            .await
+        {
+            debug!(%error, broker_id = node.id, %topic, "leadership broadcast deferred");
+        }
+    }
+}
+
+fn with_leaders(
+    mut metadata: TopicMetadata,
+    cluster: &ClusterRuntime,
+) -> Result<TopicMetadata, ConnectionError> {
+    let leadership = cluster
+        .leadership
+        .topic(&metadata.topic, metadata.partitions)?;
+    metadata.leaders = leadership.iter().map(|entry| entry.leader_id).collect();
+    metadata.leader_epochs = leadership.iter().map(|entry| entry.leader_epoch).collect();
+    Ok(metadata)
+}
+
+#[cfg(test)]
 fn leadership_error(cluster: &ClusterMetadata, partition: Option<u32>) -> Option<Response> {
     if cluster.nodes.len() == 1 {
         return None;
@@ -418,6 +622,31 @@ fn leadership_error(cluster: &ClusterMetadata, partition: Option<u32>) -> Option
     })
 }
 
+fn cluster_leadership_error(
+    cluster: &ClusterRuntime,
+    topic: &str,
+    partition: Option<u32>,
+) -> Result<Option<Response>, ConnectionError> {
+    if cluster.metadata.nodes.len() == 1 {
+        return Ok(None);
+    }
+    let Some(partition) = partition else {
+        return Ok(Some(Response::Error(
+            "partition is required for clustered produce".to_owned(),
+        )));
+    };
+    let leadership = cluster.leadership.partition(topic, partition)?;
+    Ok(
+        (leadership.leader_id != cluster.metadata.responding_broker_id).then(|| {
+            Response::Error(format!(
+                "not partition leader: partition={partition} leader_id={} leader_epoch={}",
+                leadership.leader_id, leadership.leader_epoch
+            ))
+        }),
+    )
+}
+
+#[cfg(test)]
 fn leader_for_partition(cluster: &ClusterMetadata, partition: u32) -> &ClusterNode {
     let index = usize::try_from(partition).map_or(0, |value| value % cluster.nodes.len());
     &cluster.nodes[index]
@@ -427,12 +656,14 @@ fn leader_for_partition(cluster: &ClusterMetadata, partition: u32) -> &ClusterNo
 struct ClusterRuntime {
     metadata: Arc<ClusterMetadata>,
     replicator: Replicator,
+    leadership: LeadershipRegistry,
 }
 
 #[derive(Clone)]
 struct Replicator {
     cluster: Arc<ClusterMetadata>,
     metrics: Arc<RuntimeMetrics>,
+    leadership: LeadershipRegistry,
     replication_factor: usize,
     min_in_sync_replicas: usize,
 }
@@ -441,12 +672,14 @@ impl Replicator {
     const fn new(
         cluster: Arc<ClusterMetadata>,
         metrics: Arc<RuntimeMetrics>,
+        leadership: LeadershipRegistry,
         replication_factor: usize,
         min_in_sync_replicas: usize,
     ) -> Self {
         Self {
             cluster,
             metrics,
+            leadership,
             replication_factor,
             min_in_sync_replicas,
         }
@@ -501,8 +734,9 @@ impl Replicator {
     fn replica_followers(&self, partition: u32) -> Vec<&ClusterNode> {
         let leader_index =
             usize::try_from(partition).map_or(0, |value| value % self.cluster.nodes.len());
-        (1..self.replication_factor)
+        (0..self.replication_factor)
             .map(|offset| &self.cluster.nodes[(leader_index + offset) % self.cluster.nodes.len()])
+            .filter(|node| node.id != self.cluster.responding_broker_id)
             .collect()
     }
 
@@ -515,7 +749,8 @@ impl Replicator {
         record: &FetchedRecord,
         ack_mode: AckMode,
     ) -> Result<(), ConnectionError> {
-        let request = replication_record(topic, partition, record, ack_mode);
+        let leadership = self.leadership.partition(topic, partition)?;
+        let request = replication_record(topic, record, ack_mode, leadership);
         let mut next_offset = send_replica(follower, &request).await?;
         self.observe_ack(follower.id, &request, next_offset);
         if next_offset > record.offset.saturating_add(1) {
@@ -523,7 +758,7 @@ impl Replicator {
         }
         while next_offset <= record.offset {
             let missing = storage.record_at(topic, partition, next_offset).await?;
-            let request = replication_record(topic, partition, &missing, ack_mode);
+            let request = replication_record(topic, &missing, ack_mode, leadership);
             next_offset = send_replica(follower, &request).await?;
             self.observe_ack(follower.id, &request, next_offset);
         }
@@ -543,18 +778,20 @@ impl Replicator {
 
 fn replication_record(
     topic: &str,
-    partition: u32,
     record: &FetchedRecord,
     ack_mode: AckMode,
+    leadership: sevlamq_protocol::PartitionLeadership,
 ) -> ReplicateRecord {
     ReplicateRecord {
         topic: topic.to_owned(),
-        partition,
+        partition: leadership.partition,
         offset: record.offset,
         timestamp_ms: record.timestamp_ms,
         key: record.key.clone(),
         value: record.value.clone(),
         durable: ack_mode == AckMode::Durable,
+        leader_id: leadership.leader_id,
+        leader_epoch: leadership.leader_epoch,
     }
 }
 
@@ -586,17 +823,31 @@ fn start_follower_recovery(
     cluster: Arc<ClusterMetadata>,
     metrics: Arc<RuntimeMetrics>,
     replication_factor: usize,
+    leadership: LeadershipRegistry,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
+            if let Err(error) = sync_controller_metadata(&storage, &cluster, &leadership).await {
+                debug!(%error, "controller metadata sync retry scheduled");
+            }
             let Ok(partitions) = storage.snapshot().await else {
                 metrics.replication_failed();
                 continue;
             };
             for partition in partitions {
-                let leader = leader_for_partition(&cluster, partition.partition);
+                let Ok(current) = leadership.partition(&partition.topic, partition.partition)
+                else {
+                    continue;
+                };
+                let Some(leader) = cluster
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == current.leader_id)
+                else {
+                    continue;
+                };
                 if leader.id == cluster.responding_broker_id
                     || !is_partition_replica(
                         &cluster,
@@ -609,7 +860,8 @@ fn start_follower_recovery(
                 }
                 metrics.replication_reconnect(leader.id, &partition.topic, partition.partition);
                 let result =
-                    recover_follower_partition(&storage, leader, &partition, &metrics).await;
+                    recover_follower_partition(&storage, leader, &partition, &metrics, &leadership)
+                        .await;
                 if let Err(error) = result {
                     metrics.replication_failed();
                     metrics.replica_sync(leader.id, &partition.topic, partition.partition, false);
@@ -618,6 +870,80 @@ fn start_follower_recovery(
             }
         }
     })
+}
+
+async fn sync_controller_metadata(
+    storage: &StorageHandle,
+    cluster: &ClusterMetadata,
+    leadership: &LeadershipRegistry,
+) -> Result<(), ConnectionError> {
+    let controller = cluster
+        .nodes
+        .first()
+        .ok_or(ConnectionError::InvalidClusterMetadata)?;
+    if controller.id == cluster.responding_broker_id {
+        return Ok(());
+    }
+    let address: SocketAddr = format!("{}:{}", controller.host, controller.port).parse()?;
+    let mut client = Client::connect(address).await?;
+    for topic in client.list_topics().await? {
+        if storage.describe_topic(topic.topic.clone()).await.is_err() {
+            let _ = storage
+                .create_topic(topic.topic.clone(), topic.partitions)
+                .await?;
+        }
+        leadership.ensure_topic(&topic.topic, topic.partitions)?;
+        for ((partition, leader_id), leader_epoch) in topic
+            .leaders
+            .into_iter()
+            .enumerate()
+            .zip(topic.leader_epochs)
+        {
+            let partition =
+                u32::try_from(partition).map_err(|_| ConnectionError::InvalidClusterMetadata)?;
+            let current = leadership.partition(&topic.topic, partition)?;
+            if leader_epoch > current.leader_epoch {
+                leadership.apply(
+                    &topic.topic,
+                    sevlamq_protocol::PartitionLeadership {
+                        partition,
+                        leader_id,
+                        leader_epoch,
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn initial_controller_sync(
+    storage: &StorageHandle,
+    cluster: &ClusterMetadata,
+    leadership: &LeadershipRegistry,
+) -> Result<(), BrokerError> {
+    if cluster
+        .nodes
+        .first()
+        .is_some_and(|node| node.id == cluster.responding_broker_id)
+    {
+        return Ok(());
+    }
+    let mut last_error = "controller metadata request timed out".to_owned();
+    for _ in 0..20 {
+        match timeout(
+            Duration::from_millis(500),
+            sync_controller_metadata(storage, cluster, leadership),
+        )
+        .await
+        {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => last_error = error.to_string(),
+            Err(_) => "controller metadata request timed out".clone_into(&mut last_error),
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    Err(BrokerError::ControllerUnavailable(last_error))
 }
 
 fn is_partition_replica(
@@ -637,6 +963,7 @@ async fn recover_follower_partition(
     leader: &ClusterNode,
     partition: &PartitionSnapshot,
     metrics: &RuntimeMetrics,
+    leadership: &LeadershipRegistry,
 ) -> Result<(), ConnectionError> {
     let address: SocketAddr = format!("{}:{}", leader.host, leader.port).parse()?;
     let mut client = Client::connect(address).await?;
@@ -656,6 +983,7 @@ async fn recover_follower_partition(
             return Ok(());
         }
         for record in response.records() {
+            let current = leadership.partition(&partition.topic, partition.partition)?;
             offset = storage
                 .replicate(ReplicateRecord {
                     topic: partition.topic.clone(),
@@ -665,6 +993,8 @@ async fn recover_follower_partition(
                     key: record.key.clone(),
                     value: record.value.clone(),
                     durable: true,
+                    leader_id: leader.id,
+                    leader_epoch: current.leader_epoch,
                 })
                 .await?;
             metrics.replication_received();
@@ -677,6 +1007,7 @@ async fn handle_replication_connection(
     peer: SocketAddr,
     storage: StorageHandle,
     metrics: Arc<RuntimeMetrics>,
+    leadership: LeadershipRegistry,
 ) -> Result<(), ConnectionError> {
     let mut read_buffer = BytesMut::with_capacity(8 * 1024);
     let mut write_buffer = BytesMut::with_capacity(32);
@@ -688,6 +1019,40 @@ async fn handle_replication_connection(
             return Err(ConnectionError::TruncatedFrame);
         }
         while let Some(record) = decode_replicate_record(&mut read_buffer)? {
+            let current = leadership.partition(&record.topic, record.partition)?;
+            if record.leader_epoch < current.leader_epoch
+                || (record.leader_epoch == current.leader_epoch
+                    && record.leader_id != current.leader_id)
+            {
+                return Err(ConnectionError::StaleLeaderEpoch);
+            }
+            if record.leader_epoch > current.leader_epoch {
+                let local_offset = storage
+                    .partition_offset(&record.topic, record.partition)
+                    .await?;
+                if local_offset > record.offset {
+                    storage
+                        .truncate(&record.topic, record.partition, record.offset)
+                        .await?;
+                    info!(
+                        topic = %record.topic,
+                        partition = record.partition,
+                        from_offset = local_offset,
+                        to_offset = record.offset,
+                        leader_id = record.leader_id,
+                        leader_epoch = record.leader_epoch,
+                        "divergent replica tail truncated"
+                    );
+                }
+                leadership.apply(
+                    &record.topic,
+                    sevlamq_protocol::PartitionLeadership {
+                        partition: record.partition,
+                        leader_id: record.leader_id,
+                        leader_epoch: record.leader_epoch,
+                    },
+                )?;
+            }
             let expected = storage
                 .partition_offset(&record.topic, record.partition)
                 .await?;
@@ -1294,7 +1659,10 @@ fn execute_group_request(
         | Request::CreateTopic(_)
         | Request::ListTopics
         | Request::DescribeTopic(_)
-        | Request::ClusterMetadata => {
+        | Request::ClusterMetadata
+        | Request::PromoteLeader(_)
+        | Request::ApplyLeadership(_)
+        | Request::PartitionStatus(_) => {
             unreachable!("group requests are filtered")
         }
     }
@@ -1509,6 +1877,26 @@ impl StorageHandle {
             .map_err(|_| ConnectionError::StorageUnavailable)?
             .map_err(ConnectionError::Storage)
     }
+
+    async fn truncate(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<(), ConnectionError> {
+        let (reply, response) = oneshot::channel();
+        self.enqueue(StorageCommand::Truncate {
+            topic: topic.to_owned(),
+            partition,
+            offset,
+            reply,
+        })
+        .await?;
+        response
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?
+            .map_err(ConnectionError::Storage)
+    }
 }
 
 enum StorageCommand {
@@ -1551,6 +1939,12 @@ enum StorageCommand {
         topic: String,
         partition: u32,
         reply: oneshot::Sender<Result<u64, sevlamq_storage::StorageError>>,
+    },
+    Truncate {
+        topic: String,
+        partition: u32,
+        offset: u64,
+        reply: oneshot::Sender<Result<(), sevlamq_storage::StorageError>>,
     },
     Snapshot {
         reply: oneshot::Sender<Vec<PartitionSnapshot>>,
@@ -1658,16 +2052,7 @@ fn run_storage_worker(
                 let _ = reply.send(result);
             }
             StorageCommand::ListTopics { reply } => {
-                let mut metadata: Vec<_> = topics
-                    .iter()
-                    .map(|(topic, partitions)| TopicMetadata {
-                        topic: topic.clone(),
-                        partitions: *partitions,
-                        leaders: Vec::new(),
-                    })
-                    .collect();
-                metadata.sort_unstable_by(|left, right| left.topic.cmp(&right.topic));
-                let _ = reply.send(metadata);
+                let _ = reply.send(storage_topic_metadata(topics));
             }
             StorageCommand::Append {
                 topic,
@@ -1738,6 +2123,14 @@ fn run_storage_worker(
                     .ok_or(sevlamq_storage::StorageError::UnknownPartition(partition));
                 let _ = reply.send(result);
             }
+            StorageCommand::Truncate {
+                topic,
+                partition,
+                offset,
+                reply,
+            } => {
+                let _ = reply.send(truncate_partition(logs, topic, partition, offset));
+            }
             StorageCommand::Snapshot { reply } => {
                 let _ = reply.send(snapshot_logs(logs));
             }
@@ -1746,6 +2139,31 @@ fn run_storage_worker(
             }
         }
     }
+}
+
+fn truncate_partition(
+    logs: &mut PartitionLogs,
+    topic: String,
+    partition: u32,
+    offset: u64,
+) -> Result<(), sevlamq_storage::StorageError> {
+    logs.get_mut(&(topic, partition))
+        .ok_or(sevlamq_storage::StorageError::UnknownPartition(partition))?
+        .truncate_to(offset)
+}
+
+fn storage_topic_metadata(topics: &HashMap<String, u32>) -> Vec<TopicMetadata> {
+    let mut metadata: Vec<_> = topics
+        .iter()
+        .map(|(topic, partitions)| TopicMetadata {
+            topic: topic.clone(),
+            partitions: *partitions,
+            leaders: Vec::new(),
+            leader_epochs: Vec::new(),
+        })
+        .collect();
+    metadata.sort_unstable_by(|left, right| left.topic.cmp(&right.topic));
+    metadata
 }
 
 fn snapshot_logs(logs: &PartitionLogs) -> Vec<PartitionSnapshot> {
@@ -1999,6 +2417,7 @@ fn create_topic(
         topic: topic.to_owned(),
         partitions,
         leaders: Vec::new(),
+        leader_epochs: Vec::new(),
     })
 }
 
@@ -2106,6 +2525,8 @@ pub enum BrokerError {
     StorageWorker(#[from] tokio::task::JoinError),
     #[error(transparent)]
     Group(#[from] groups::GroupError),
+    #[error(transparent)]
+    Leadership(#[from] leadership::LeadershipError),
     #[error("default partition count must be greater than zero")]
     InvalidPartitionCount,
     #[error("storage queue capacity and enqueue timeout must be greater than zero")]
@@ -2114,6 +2535,8 @@ pub enum BrokerError {
     StorageUnavailable,
     #[error("local broker is missing from cluster metadata")]
     InvalidClusterMetadata,
+    #[error("controller metadata is unavailable during startup: {0}")]
+    ControllerUnavailable(String),
     #[error(
         "topic {topic} has partition {partition}, outside configured partition count {partition_count}"
     )]
@@ -2134,6 +2557,8 @@ enum ConnectionError {
     Client(#[from] sevlamq_client::ClientError),
     #[error("invalid broker address: {0}")]
     Address(#[from] std::net::AddrParseError),
+    #[error(transparent)]
+    Leadership(#[from] leadership::LeadershipError),
     #[error("connection closed with a partial frame")]
     TruncatedFrame,
     #[error(transparent)]
@@ -2148,8 +2573,24 @@ enum ConnectionError {
     InvalidReplicationAck,
     #[error("newly appended record could not be read back")]
     MissingAppendedRecord,
+    #[error("replication request came from a stale leader epoch")]
+    StaleLeaderEpoch,
     #[error("not enough in-sync replicas: required={required} available={available}")]
     NotEnoughInSyncReplicas { required: usize, available: usize },
+    #[error("cluster metadata contains no controller")]
+    InvalidClusterMetadata,
+    #[error("leader epoch space is exhausted")]
+    LeaderEpochOverflow,
+    #[error("promotion candidate is unavailable")]
+    PromotionCandidateUnavailable,
+    #[error(
+        "unsafe promotion: candidate_offset={candidate} highest_offset={highest} available_replicas={available}"
+    )]
+    UnsafePromotion {
+        candidate: u64,
+        highest: u64,
+        available: usize,
+    },
 }
 
 #[cfg(test)]
@@ -2169,10 +2610,10 @@ mod tests {
     };
 
     use super::{
-        ClusterRuntime, ConnectionError, GroupHandle, PartitionSnapshot, Replicator,
-        RuntimeMetrics, StorageCommand, StorageHandle, StorageSettings, handle_connection,
-        leader_for_partition, leadership_error, render_metrics, select_partition,
-        start_storage_worker,
+        ClusterRuntime, ConnectionError, GroupHandle, LeadershipRegistry, PartitionSnapshot,
+        Replicator, RuntimeMetrics, StorageCommand, StorageHandle, StorageSettings,
+        handle_connection, leader_for_partition, leadership_error, render_metrics,
+        select_partition, start_storage_worker,
     };
 
     fn test_storage_settings(data_dir: &std::path::Path, partitions: u32) -> StorageSettings {
@@ -2236,6 +2677,53 @@ mod tests {
             })
             .collect(),
         })
+    }
+
+    fn test_leadership(
+        data_dir: &std::path::Path,
+        cluster: Arc<ClusterMetadata>,
+    ) -> LeadershipRegistry {
+        let leadership =
+            LeadershipRegistry::open(data_dir, cluster).expect("leadership registry should open");
+        leadership
+            .ensure_topic("payments", 3)
+            .expect("topic leadership should initialize");
+        leadership
+    }
+
+    fn test_cluster_runtime(
+        data_dir: &std::path::Path,
+        cluster: Arc<ClusterMetadata>,
+        replication_factor: usize,
+        min_in_sync_replicas: usize,
+    ) -> ClusterRuntime {
+        let leadership = test_leadership(data_dir, Arc::clone(&cluster));
+        ClusterRuntime {
+            metadata: Arc::clone(&cluster),
+            replicator: Replicator::new(
+                cluster,
+                Arc::new(RuntimeMetrics::default()),
+                leadership.clone(),
+                replication_factor,
+                min_in_sync_replicas,
+            ),
+            leadership,
+        }
+    }
+
+    fn test_replicator(
+        cluster: Arc<ClusterMetadata>,
+        leadership: LeadershipRegistry,
+        replication_factor: usize,
+        min_in_sync_replicas: usize,
+    ) -> Replicator {
+        Replicator::new(
+            cluster,
+            Arc::new(RuntimeMetrics::default()),
+            leadership,
+            replication_factor,
+            min_in_sync_replicas,
+        )
     }
 
     async fn assert_rejects_without_quorum(
@@ -2536,6 +3024,9 @@ mod tests {
             .expect("unused listener should bind")
             .local_addr()
             .expect("unused listener should have an address");
+        let cluster = replication_cluster(address.port(), unavailable.port());
+        let leader_leadership = test_leadership(leader_dir.path(), Arc::clone(&cluster));
+        let follower_leadership = test_leadership(follower_dir.path(), Arc::clone(&cluster));
         let follower_server = follower.clone();
         let server = tokio::spawn(async move {
             for _ in 0..4 {
@@ -2545,18 +3036,13 @@ mod tests {
                     peer,
                     follower_server.clone(),
                     Arc::new(RuntimeMetrics::default()),
+                    follower_leadership.clone(),
                 )
                 .await
                 .expect("replication request should succeed");
             }
         });
-        let cluster = replication_cluster(address.port(), unavailable.port());
-        let replicator = Replicator::new(
-            Arc::clone(&cluster),
-            Arc::new(RuntimeMetrics::default()),
-            3,
-            2,
-        );
+        let replicator = test_replicator(Arc::clone(&cluster), leader_leadership.clone(), 3, 2);
         let latest = leader
             .record_at("payments", 0, 2)
             .await
@@ -2574,7 +3060,7 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].offset, 2);
 
-        let without_followers = Replicator::new(cluster, Arc::new(RuntimeMetrics::default()), 3, 2);
+        let without_followers = test_replicator(cluster, leader_leadership, 3, 2);
         assert_rejects_without_quorum(&without_followers, &leader, &latest).await;
 
         drop(leader);
@@ -2632,6 +3118,7 @@ mod tests {
             let connection_storage = storage.clone();
             let groups = GroupHandle::open(data_dir.path(), 3, Duration::from_secs(10))
                 .expect("group coordinator should start");
+            let cluster = test_cluster_runtime(data_dir.path(), test_cluster(), 1, 1);
             let server = tokio::spawn(async move {
                 let (stream, peer) = listener.accept().await.expect("connection should arrive");
                 handle_connection(
@@ -2641,15 +3128,7 @@ mod tests {
                     connection_storage,
                     groups,
                     Arc::new(RuntimeMetrics::default()),
-                    ClusterRuntime {
-                        metadata: test_cluster(),
-                        replicator: Replicator::new(
-                            test_cluster(),
-                            Arc::new(RuntimeMetrics::default()),
-                            1,
-                            1,
-                        ),
-                    },
+                    cluster,
                 )
                 .await
             });

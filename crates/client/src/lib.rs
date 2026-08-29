@@ -2,10 +2,11 @@ use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
 use sevlamq_protocol::{
-    AckMode, ClusterMetadata, ClusterNode, CommitOffsetRequest, CreateTopicRequest,
-    FetchCommittedOffsetRequest, FetchRequest, FetchResponse, GroupFetchRequest,
-    GroupGenerationRequest, GroupMemberRequest, JoinGroupResponse, ProduceAck, ProduceBatchRequest,
-    ProduceRequest, ProducerIdentity, Request, Response, TopicMetadata, decode_response,
+    AckMode, ApplyLeadershipRequest, ClusterMetadata, ClusterNode, CommitOffsetRequest,
+    CreateTopicRequest, FetchCommittedOffsetRequest, FetchRequest, FetchResponse,
+    GroupFetchRequest, GroupGenerationRequest, GroupMemberRequest, JoinGroupResponse,
+    PartitionLeadership, PartitionStatusRequest, ProduceAck, ProduceBatchRequest, ProduceRequest,
+    ProducerIdentity, PromoteLeaderRequest, Request, Response, TopicMetadata, decode_response,
     encode_request,
 };
 use thiserror::Error;
@@ -60,7 +61,7 @@ impl Client {
             let partition =
                 routing_key.map_or(0, |key| crc32fast::hash(key) % topic_metadata.partitions);
             request = request.with_partition(partition);
-            leader_address(&cluster, partition)?
+            topic_leader_address(&cluster, &topic_metadata, partition)?
         };
         match self.request_at(address, Request::Produce(request)).await? {
             Response::ProduceAck(ack) => Ok(ack),
@@ -89,7 +90,7 @@ impl Client {
                 return Err(ClientError::BatchSpansPartitions);
             }
             (
-                leader_address(&cluster, partition)?,
+                topic_leader_address(&cluster, &topic, partition)?,
                 request.with_partition(partition),
             )
         };
@@ -108,37 +109,53 @@ impl Client {
         partitions: u32,
     ) -> Result<TopicMetadata, ClientError> {
         let cluster = self.cluster_metadata().await?;
-        let mut created = None;
-        for node in &cluster.nodes {
-            let address = node_address(node)?;
-            match self
-                .request_at(
-                    address,
-                    Request::CreateTopic(CreateTopicRequest {
-                        topic: topic.clone(),
-                        partitions,
-                    }),
-                )
-                .await?
-            {
-                Response::Topics(mut topics) if topics.len() == 1 => {
-                    created.get_or_insert_with(|| topics.remove(0));
-                }
-                _ => return Err(ClientError::UnexpectedResponse),
-            }
+        let address = controller_address(&cluster)?;
+        match self
+            .request_at(
+                address,
+                Request::CreateTopic(CreateTopicRequest { topic, partitions }),
+            )
+            .await?
+        {
+            Response::Topics(mut topics) if topics.len() == 1 => Ok(topics.remove(0)),
+            _ => Err(ClientError::UnexpectedResponse),
         }
-        created.ok_or(ClientError::UnexpectedResponse)
+    }
+
+    pub async fn apply_topic(
+        &mut self,
+        address: SocketAddr,
+        topic: String,
+        partitions: u32,
+    ) -> Result<(), ClientError> {
+        match self
+            .request_at(
+                address,
+                Request::CreateTopic(CreateTopicRequest { topic, partitions }),
+            )
+            .await?
+        {
+            Response::Topics(_) => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
     }
 
     pub async fn list_topics(&mut self) -> Result<Vec<TopicMetadata>, ClientError> {
-        match self.request(Request::ListTopics).await? {
+        let cluster = self.cluster_metadata().await?;
+        let address = controller_address(&cluster)?;
+        match self.request_at(address, Request::ListTopics).await? {
             Response::Topics(topics) => Ok(topics),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
 
     pub async fn describe_topic(&mut self, topic: String) -> Result<TopicMetadata, ClientError> {
-        match self.request(Request::DescribeTopic(topic)).await? {
+        let cluster = self.cluster_metadata().await?;
+        let address = controller_address(&cluster)?;
+        match self
+            .request_at(address, Request::DescribeTopic(topic))
+            .await?
+        {
             Response::Topics(mut topics) if topics.len() == 1 => Ok(topics.remove(0)),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -147,6 +164,67 @@ impl Client {
     pub async fn cluster_metadata(&mut self) -> Result<ClusterMetadata, ClientError> {
         match self.request(Request::ClusterMetadata).await? {
             Response::ClusterMetadata(metadata) => Ok(metadata),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn promote_leader(
+        &mut self,
+        topic: String,
+        partition: u32,
+        leader_id: u32,
+    ) -> Result<PartitionLeadership, ClientError> {
+        let cluster = self.cluster_metadata().await?;
+        let controller = cluster.nodes.first().ok_or(ClientError::EmptyCluster)?;
+        let address = node_address(controller)?;
+        match self
+            .request_at(
+                address,
+                Request::PromoteLeader(PromoteLeaderRequest {
+                    topic,
+                    partition,
+                    leader_id,
+                }),
+            )
+            .await?
+        {
+            Response::LeadershipChanged(leadership) => Ok(leadership),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn apply_leadership(
+        &mut self,
+        address: SocketAddr,
+        topic: String,
+        leadership: PartitionLeadership,
+    ) -> Result<(), ClientError> {
+        match self
+            .request_at(
+                address,
+                Request::ApplyLeadership(ApplyLeadershipRequest { topic, leadership }),
+            )
+            .await?
+        {
+            Response::LeadershipChanged(_) => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn partition_status(
+        &mut self,
+        address: SocketAddr,
+        topic: String,
+        partition: u32,
+    ) -> Result<u64, ClientError> {
+        match self
+            .request_at(
+                address,
+                Request::PartitionStatus(PartitionStatusRequest { topic, partition }),
+            )
+            .await?
+        {
+            Response::PartitionStatus(offset) => Ok(offset),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -170,7 +248,11 @@ impl Client {
         let address = if cluster.nodes.len() == 1 {
             self.address
         } else {
-            leader_address(&cluster, partition)?
+            let topic = match &request {
+                Request::Fetch(request) => self.describe_topic(request.topic().to_owned()).await?,
+                _ => unreachable!("fetch routing only handles fetch requests"),
+            };
+            topic_leader_address(&cluster, &topic, partition)?
         };
         match self.request_at(address, request).await? {
             Response::Fetch(response) => Ok(response),
@@ -301,16 +383,30 @@ impl Client {
     }
 }
 
-fn leader_address(cluster: &ClusterMetadata, partition: u32) -> Result<SocketAddr, ClientError> {
-    let partition = usize::try_from(partition).map_err(|_| ClientError::InvalidPartition)?;
-    if cluster.nodes.is_empty() {
-        return Err(ClientError::EmptyCluster);
-    }
-    let node = cluster
+fn topic_leader_address(
+    cluster: &ClusterMetadata,
+    topic: &TopicMetadata,
+    partition: u32,
+) -> Result<SocketAddr, ClientError> {
+    let index = usize::try_from(partition).map_err(|_| ClientError::InvalidPartition)?;
+    let leader_id = topic
+        .leaders
+        .get(index)
+        .ok_or(ClientError::InvalidPartition)?;
+    cluster
         .nodes
-        .get(partition % cluster.nodes.len())
-        .ok_or(ClientError::EmptyCluster)?;
-    node_address(node)
+        .iter()
+        .find(|node| node.id == *leader_id)
+        .ok_or(ClientError::UnknownLeader(*leader_id))
+        .and_then(node_address)
+}
+
+fn controller_address(cluster: &ClusterMetadata) -> Result<SocketAddr, ClientError> {
+    cluster
+        .nodes
+        .first()
+        .ok_or(ClientError::EmptyCluster)
+        .and_then(node_address)
 }
 
 fn node_address(node: &ClusterNode) -> Result<SocketAddr, ClientError> {
@@ -335,6 +431,8 @@ pub enum ClientError {
     EmptyCluster,
     #[error("partition does not fit this platform's address space")]
     InvalidPartition,
+    #[error("topic metadata references unknown leader {0}")]
+    UnknownLeader(u32),
     #[error("a compressed batch cannot span multiple partitions")]
     BatchSpansPartitions,
     #[error("broker rejected the request: {0}")]

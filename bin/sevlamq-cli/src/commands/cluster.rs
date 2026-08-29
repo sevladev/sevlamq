@@ -26,6 +26,17 @@ pub(super) async fn execute(client: &mut Client, command: ClusterCommand) -> Res
                 );
             }
         }
+        ClusterCommand::Promote {
+            topic,
+            partition,
+            broker_id,
+        } => {
+            let leadership = client.promote_leader(topic, partition, broker_id).await?;
+            println!(
+                "partition={} leader={} epoch={}",
+                leadership.partition, leadership.leader_id, leadership.leader_epoch
+            );
+        }
     }
     Ok(())
 }

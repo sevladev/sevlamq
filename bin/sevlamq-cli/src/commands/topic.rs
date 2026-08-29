@@ -24,7 +24,14 @@ fn print_topic(topic: &sevlamq_protocol::TopicMetadata) {
         .leaders
         .iter()
         .enumerate()
-        .map(|(partition, leader)| format!("{partition}:{leader}"))
+        .map(|(partition, leader)| {
+            let epoch = topic
+                .leader_epochs
+                .get(partition)
+                .copied()
+                .unwrap_or_default();
+            format!("{partition}:{leader}@{epoch}")
+        })
         .collect::<Vec<_>>()
         .join(",");
     println!(
