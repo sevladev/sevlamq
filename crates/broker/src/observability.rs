@@ -80,6 +80,7 @@ pub struct RuntimeMetrics {
     replication_reconnects: AtomicU64,
     replica_offsets: Mutex<HashMap<(u32, String, u32), u64>>,
     replica_sync: Mutex<HashMap<(u32, String, u32), bool>>,
+    in_sync_replicas: Mutex<HashMap<(u32, String, u32), bool>>,
     produce_latency: Histogram,
     fetch_latency: Histogram,
     append_latency: Histogram,
@@ -175,6 +176,26 @@ impl RuntimeMetrics {
                     .iter()
                     .map(|((leader, topic, partition), in_sync)| {
                         (*leader, topic.clone(), *partition, *in_sync)
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    pub fn in_sync_replica(&self, broker_id: u32, topic: &str, partition: u32, in_sync: bool) {
+        if let Ok(mut replicas) = self.in_sync_replicas.lock() {
+            replicas.insert((broker_id, topic.to_owned(), partition), in_sync);
+        }
+    }
+
+    pub fn in_sync_replica_states(&self) -> Vec<(u32, String, u32, bool)> {
+        self.in_sync_replicas.lock().map_or_else(
+            |_| Vec::new(),
+            |replicas| {
+                replicas
+                    .iter()
+                    .map(|((broker, topic, partition), in_sync)| {
+                        (*broker, topic.clone(), *partition, *in_sync)
                     })
                     .collect()
             },

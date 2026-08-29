@@ -84,7 +84,12 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
         format!("{}:{}", local_node.host, local_node.replication_port).parse()?;
     let replication_listener = TcpListener::bind(replication_address).await?;
     let cluster_runtime = ClusterRuntime {
-        replicator: Replicator::new(Arc::clone(&cluster), Arc::clone(&metrics)),
+        replicator: Replicator::new(
+            Arc::clone(&cluster),
+            Arc::clone(&metrics),
+            config.cluster.replication_factor,
+            config.cluster.min_in_sync_replicas,
+        ),
         metadata: Arc::clone(&cluster),
     };
     let groups = GroupHandle::open(
@@ -105,6 +110,7 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
         storage.clone(),
         Arc::clone(&cluster_runtime.metadata),
         Arc::clone(&metrics),
+        config.cluster.replication_factor,
     );
     let accept_result = accept_connections(
         &listener,
@@ -219,6 +225,9 @@ async fn handle_connection(
                     Response::Error("broker busy: storage queue timeout".to_owned())
                 }
                 Err(ConnectionError::Storage(error)) => Response::Error(error.to_string()),
+                Err(error @ ConnectionError::NotEnoughInSyncReplicas { .. }) => {
+                    Response::Error(error.to_string())
+                }
                 Err(error) => return Err(error),
             };
             match operation {
@@ -424,11 +433,23 @@ struct ClusterRuntime {
 struct Replicator {
     cluster: Arc<ClusterMetadata>,
     metrics: Arc<RuntimeMetrics>,
+    replication_factor: usize,
+    min_in_sync_replicas: usize,
 }
 
 impl Replicator {
-    const fn new(cluster: Arc<ClusterMetadata>, metrics: Arc<RuntimeMetrics>) -> Self {
-        Self { cluster, metrics }
+    const fn new(
+        cluster: Arc<ClusterMetadata>,
+        metrics: Arc<RuntimeMetrics>,
+        replication_factor: usize,
+        min_in_sync_replicas: usize,
+    ) -> Self {
+        Self {
+            cluster,
+            metrics,
+            replication_factor,
+            min_in_sync_replicas,
+        }
     }
 
     async fn replicate(
@@ -439,54 +460,101 @@ impl Replicator {
         record: &FetchedRecord,
         ack_mode: AckMode,
     ) -> Result<(), ConnectionError> {
-        for follower in self
-            .cluster
-            .nodes
-            .iter()
-            .filter(|node| node.id != self.cluster.responding_broker_id)
-        {
-            let request = ReplicateRecord {
-                topic: topic.to_owned(),
-                partition,
-                offset: record.offset,
-                timestamp_ms: record.timestamp_ms,
-                key: record.key.clone(),
-                value: record.value.clone(),
-                durable: ack_mode == AckMode::Durable,
-            };
-            let mut next_offset = send_replica(follower, &request).await?;
-            self.metrics.replication_sent(
-                follower.id,
-                topic,
-                partition,
-                next_offset,
-                next_offset == request.offset.saturating_add(1),
-            );
-            if next_offset > record.offset.saturating_add(1) {
-                return Err(ConnectionError::InvalidReplicationAck);
-            }
-            while next_offset <= record.offset {
-                let missing = storage.record_at(topic, partition, next_offset).await?;
-                let request = ReplicateRecord {
-                    topic: topic.to_owned(),
-                    partition,
-                    offset: missing.offset,
-                    timestamp_ms: missing.timestamp_ms,
-                    key: missing.key,
-                    value: missing.value,
-                    durable: ack_mode == AckMode::Durable,
-                };
-                next_offset = send_replica(follower, &request).await?;
-                self.metrics.replication_sent(
-                    follower.id,
-                    topic,
-                    partition,
-                    next_offset,
-                    next_offset == request.offset.saturating_add(1),
-                );
+        let mut acknowledgements = 1;
+        self.metrics
+            .in_sync_replica(self.cluster.responding_broker_id, topic, partition, true);
+        for follower in self.replica_followers(partition) {
+            let replication = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.replicate_to_follower(storage, follower, topic, partition, record, ack_mode),
+            )
+            .await;
+            match replication {
+                Ok(Ok(())) => {
+                    acknowledgements += 1;
+                    self.metrics
+                        .in_sync_replica(follower.id, topic, partition, true);
+                }
+                Ok(Err(error)) => {
+                    self.metrics.replication_failed();
+                    self.metrics
+                        .in_sync_replica(follower.id, topic, partition, false);
+                    debug!(%error, follower_id = follower.id, %topic, partition, "replica left ISR");
+                }
+                Err(_) => {
+                    self.metrics.replication_failed();
+                    self.metrics
+                        .in_sync_replica(follower.id, topic, partition, false);
+                    debug!(follower_id = follower.id, %topic, partition, "replica timed out and left ISR");
+                }
             }
         }
+        if ack_mode == AckMode::Durable && acknowledgements < self.min_in_sync_replicas {
+            return Err(ConnectionError::NotEnoughInSyncReplicas {
+                required: self.min_in_sync_replicas,
+                available: acknowledgements,
+            });
+        }
         Ok(())
+    }
+
+    fn replica_followers(&self, partition: u32) -> Vec<&ClusterNode> {
+        let leader_index =
+            usize::try_from(partition).map_or(0, |value| value % self.cluster.nodes.len());
+        (1..self.replication_factor)
+            .map(|offset| &self.cluster.nodes[(leader_index + offset) % self.cluster.nodes.len()])
+            .collect()
+    }
+
+    async fn replicate_to_follower(
+        &self,
+        storage: &StorageHandle,
+        follower: &ClusterNode,
+        topic: &str,
+        partition: u32,
+        record: &FetchedRecord,
+        ack_mode: AckMode,
+    ) -> Result<(), ConnectionError> {
+        let request = replication_record(topic, partition, record, ack_mode);
+        let mut next_offset = send_replica(follower, &request).await?;
+        self.observe_ack(follower.id, &request, next_offset);
+        if next_offset > record.offset.saturating_add(1) {
+            return Err(ConnectionError::InvalidReplicationAck);
+        }
+        while next_offset <= record.offset {
+            let missing = storage.record_at(topic, partition, next_offset).await?;
+            let request = replication_record(topic, partition, &missing, ack_mode);
+            next_offset = send_replica(follower, &request).await?;
+            self.observe_ack(follower.id, &request, next_offset);
+        }
+        Ok(())
+    }
+
+    fn observe_ack(&self, follower_id: u32, request: &ReplicateRecord, next_offset: u64) {
+        self.metrics.replication_sent(
+            follower_id,
+            &request.topic,
+            request.partition,
+            next_offset,
+            next_offset == request.offset.saturating_add(1),
+        );
+    }
+}
+
+fn replication_record(
+    topic: &str,
+    partition: u32,
+    record: &FetchedRecord,
+    ack_mode: AckMode,
+) -> ReplicateRecord {
+    ReplicateRecord {
+        topic: topic.to_owned(),
+        partition,
+        offset: record.offset,
+        timestamp_ms: record.timestamp_ms,
+        key: record.key.clone(),
+        value: record.value.clone(),
+        durable: ack_mode == AckMode::Durable,
     }
 }
 
@@ -517,6 +585,7 @@ fn start_follower_recovery(
     storage: StorageHandle,
     cluster: Arc<ClusterMetadata>,
     metrics: Arc<RuntimeMetrics>,
+    replication_factor: usize,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -528,7 +597,14 @@ fn start_follower_recovery(
             };
             for partition in partitions {
                 let leader = leader_for_partition(&cluster, partition.partition);
-                if leader.id == cluster.responding_broker_id {
+                if leader.id == cluster.responding_broker_id
+                    || !is_partition_replica(
+                        &cluster,
+                        cluster.responding_broker_id,
+                        partition.partition,
+                        replication_factor,
+                    )
+                {
                     continue;
                 }
                 metrics.replication_reconnect(leader.id, &partition.topic, partition.partition);
@@ -542,6 +618,18 @@ fn start_follower_recovery(
             }
         }
     })
+}
+
+fn is_partition_replica(
+    cluster: &ClusterMetadata,
+    broker_id: u32,
+    partition: u32,
+    replication_factor: usize,
+) -> bool {
+    let leader_index = usize::try_from(partition).map_or(0, |value| value % cluster.nodes.len());
+    (0..replication_factor)
+        .map(|offset| &cluster.nodes[(leader_index + offset) % cluster.nodes.len()])
+        .any(|node| node.id == broker_id)
 }
 
 async fn recover_follower_partition(
@@ -927,6 +1015,16 @@ fn render_replication_metrics(
         let _ = writeln!(
             output,
             "sevlamq_replica_in_sync{{leader_id=\"{leader}\",topic=\"{topic}\",partition=\"{partition}\"}} {value}"
+        );
+    }
+    output.push_str("# HELP sevlamq_partition_isr Broker membership in a partition ISR.\n");
+    output.push_str("# TYPE sevlamq_partition_isr gauge\n");
+    for (broker, topic, partition, in_sync) in metrics.in_sync_replica_states() {
+        let topic = observability::escape_label(&topic);
+        let value = u8::from(in_sync);
+        let _ = writeln!(
+            output,
+            "sevlamq_partition_isr{{broker_id=\"{broker}\",topic=\"{topic}\",partition=\"{partition}\"}} {value}"
         );
     }
 }
@@ -2050,6 +2148,8 @@ enum ConnectionError {
     InvalidReplicationAck,
     #[error("newly appended record could not be read back")]
     MissingAppendedRecord,
+    #[error("not enough in-sync replicas: required={required} available={available}")]
+    NotEnoughInSyncReplicas { required: usize, available: usize },
 }
 
 #[cfg(test)]
@@ -2116,6 +2216,42 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn replication_cluster(active_port: u16, unavailable_port: u16) -> Arc<ClusterMetadata> {
+        Arc::new(ClusterMetadata {
+            responding_broker_id: 1,
+            nodes: [
+                (1, 1, 2, 3),
+                (2, 4, 5, active_port),
+                (3, 6, 7, unavailable_port),
+            ]
+            .into_iter()
+            .map(|(id, port, admin_port, replication_port)| ClusterNode {
+                id,
+                host: "127.0.0.1".to_owned(),
+                port,
+                admin_port,
+                replication_port,
+            })
+            .collect(),
+        })
+    }
+
+    async fn assert_rejects_without_quorum(
+        replicator: &Replicator,
+        storage: &StorageHandle,
+        record: &sevlamq_protocol::FetchedRecord,
+    ) {
+        assert!(matches!(
+            replicator
+                .replicate(storage, "payments", 0, record, AckMode::Durable)
+                .await,
+            Err(ConnectionError::NotEnoughInSyncReplicas {
+                required: 2,
+                available: 1
+            })
+        ));
     }
 
     #[test]
@@ -2395,6 +2531,11 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("replication listener should have an address");
+        let unavailable = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("unused listener should bind")
+            .local_addr()
+            .expect("unused listener should have an address");
         let follower_server = follower.clone();
         let server = tokio::spawn(async move {
             for _ in 0..4 {
@@ -2409,26 +2550,13 @@ mod tests {
                 .expect("replication request should succeed");
             }
         });
-        let cluster = Arc::new(ClusterMetadata {
-            responding_broker_id: 1,
-            nodes: vec![
-                ClusterNode {
-                    id: 1,
-                    host: "127.0.0.1".to_owned(),
-                    port: 1,
-                    admin_port: 2,
-                    replication_port: 3,
-                },
-                ClusterNode {
-                    id: 2,
-                    host: "127.0.0.1".to_owned(),
-                    port: 4,
-                    admin_port: 5,
-                    replication_port: address.port(),
-                },
-            ],
-        });
-        let replicator = Replicator::new(cluster, Arc::new(RuntimeMetrics::default()));
+        let cluster = replication_cluster(address.port(), unavailable.port());
+        let replicator = Replicator::new(
+            Arc::clone(&cluster),
+            Arc::new(RuntimeMetrics::default()),
+            3,
+            2,
+        );
         let latest = leader
             .record_at("payments", 0, 2)
             .await
@@ -2445,6 +2573,9 @@ mod tests {
             .expect("follower records should be readable");
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].offset, 2);
+
+        let without_followers = Replicator::new(cluster, Arc::new(RuntimeMetrics::default()), 3, 2);
+        assert_rejects_without_quorum(&without_followers, &leader, &latest).await;
 
         drop(leader);
         drop(follower);
@@ -2515,6 +2646,8 @@ mod tests {
                         replicator: Replicator::new(
                             test_cluster(),
                             Arc::new(RuntimeMetrics::default()),
+                            1,
+                            1,
                         ),
                     },
                 )

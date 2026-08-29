@@ -21,6 +21,8 @@ json = false
 
 [cluster]
 broker_id = 3
+replication_factor = 3
+min_in_sync_replicas = 2
 
 [[cluster.nodes]]
 id = 1
@@ -42,4 +44,3 @@ host = "127.0.0.1"
 port = 7600
 admin_port = 7601
 replication_port = 7602
-

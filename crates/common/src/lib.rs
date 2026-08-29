@@ -17,14 +17,28 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ClusterConfig {
     pub broker_id: u32,
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: usize,
+    #[serde(default = "default_min_in_sync_replicas")]
+    pub min_in_sync_replicas: usize,
     #[serde(default)]
     pub nodes: Vec<ClusterNodeConfig>,
+}
+
+const fn default_replication_factor() -> usize {
+    1
+}
+
+const fn default_min_in_sync_replicas() -> usize {
+    1
 }
 
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             broker_id: 1,
+            replication_factor: default_replication_factor(),
+            min_in_sync_replicas: default_min_in_sync_replicas(),
             nodes: Vec::new(),
         }
     }
@@ -119,6 +133,13 @@ impl Config {
         if !ids.contains(&self.cluster.broker_id) {
             return Err(ConfigError::LocalBrokerMissing);
         }
+        if self.cluster.replication_factor == 0
+            || self.cluster.replication_factor > nodes.len()
+            || self.cluster.min_in_sync_replicas == 0
+            || self.cluster.min_in_sync_replicas > self.cluster.replication_factor
+        {
+            return Err(ConfigError::InvalidReplicationPolicy);
+        }
         nodes.sort_unstable_by_key(|node| node.id);
         Ok(nodes)
     }
@@ -154,6 +175,8 @@ pub enum ConfigError {
     InvalidCluster,
     #[error("local broker_id is not present in cluster nodes")]
     LocalBrokerMissing,
+    #[error("replication_factor and min_in_sync_replicas do not fit cluster membership")]
+    InvalidReplicationPolicy,
 }
 
 #[cfg(test)]
@@ -230,8 +253,15 @@ mod tests {
             "#,
         )
         .expect("configuration should parse");
+        config.cluster.replication_factor = 2;
+        assert!(matches!(
+            config.cluster_nodes(),
+            Err(ConfigError::InvalidReplicationPolicy)
+        ));
         config.cluster = ClusterConfig {
             broker_id: 2,
+            replication_factor: 1,
+            min_in_sync_replicas: 1,
             nodes: vec![ClusterNodeConfig {
                 id: 1,
                 host: "127.0.0.1".to_owned(),

@@ -21,3 +21,5 @@ json = false
 
 [cluster]
 broker_id = 1
+replication_factor = 1
+min_in_sync_replicas = 1
