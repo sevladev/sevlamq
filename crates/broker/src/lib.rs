@@ -116,9 +116,9 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
     initial_controller_sync(&storage, &cluster, &leadership).await?;
 
     info!(broker_id = cluster.responding_broker_id, %address, %admin_address, %replication_address, data_dir = %broker_config.data_dir, "broker started");
-    let recovery_worker = start_follower_recovery(
+    let (recovery_worker, leader_monitor) = start_cluster_workers(
         storage.clone(),
-        Arc::clone(&cluster_runtime.metadata),
+        cluster_runtime.clone(),
         Arc::clone(&metrics),
         config.cluster.replication_factor,
         leadership,
@@ -133,8 +133,7 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
         cluster_runtime,
     )
     .await;
-    recovery_worker.abort();
-    let _ = recovery_worker.await;
+    stop_cluster_workers(recovery_worker, leader_monitor).await;
     accept_result?;
     info!("shutdown signal received");
 
@@ -143,6 +142,31 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
     drop(listener);
     info!("broker stopped");
     Ok(())
+}
+
+fn start_cluster_workers(
+    storage: StorageHandle,
+    cluster: ClusterRuntime,
+    metrics: Arc<RuntimeMetrics>,
+    replication_factor: usize,
+    leadership: LeadershipRegistry,
+) -> (JoinHandle<()>, JoinHandle<()>) {
+    let recovery = start_follower_recovery(
+        storage.clone(),
+        Arc::clone(&cluster.metadata),
+        Arc::clone(&metrics),
+        replication_factor,
+        leadership,
+    );
+    let monitor = start_leader_monitor(storage, cluster, metrics);
+    (recovery, monitor)
+}
+
+async fn stop_cluster_workers(recovery: JoinHandle<()>, monitor: JoinHandle<()>) {
+    recovery.abort();
+    monitor.abort();
+    let _ = recovery.await;
+    let _ = monitor.await;
 }
 
 async fn migrate_topic_high_watermarks(
@@ -969,6 +993,159 @@ fn start_follower_recovery(
             }
         }
     })
+}
+
+fn start_leader_monitor(
+    storage: StorageHandle,
+    cluster: ClusterRuntime,
+    metrics: Arc<RuntimeMetrics>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if cluster
+            .metadata
+            .nodes
+            .first()
+            .is_none_or(|node| node.id != cluster.metadata.responding_broker_id)
+        {
+            return;
+        }
+        let mut failures = HashMap::<(String, u32), u8>::new();
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                monitor_partition_leaders(&storage, &cluster, &metrics, &mut failures).await
+            {
+                debug!(%error, "automatic leader monitor cycle failed");
+            }
+        }
+    })
+}
+
+async fn monitor_partition_leaders(
+    storage: &StorageHandle,
+    cluster: &ClusterRuntime,
+    metrics: &RuntimeMetrics,
+    failures: &mut HashMap<(String, u32), u8>,
+) -> Result<(), ConnectionError> {
+    for topic in storage.list_topics().await? {
+        for current in cluster.leadership.topic(&topic.topic, topic.partitions)? {
+            if current.leader_id == cluster.metadata.responding_broker_id {
+                failures.remove(&(topic.topic.clone(), current.partition));
+                continue;
+            }
+            let leader = cluster
+                .metadata
+                .nodes
+                .iter()
+                .find(|node| node.id == current.leader_id)
+                .ok_or(ConnectionError::InvalidClusterMetadata)?;
+            let responding = timeout(
+                Duration::from_millis(500),
+                query_partition_offset(leader, &topic.topic, current.partition),
+            )
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+            let key = (topic.topic.clone(), current.partition);
+            if responding {
+                failures.remove(&key);
+                continue;
+            }
+            let attempts = failures.entry(key.clone()).or_default();
+            *attempts = attempts.saturating_add(1);
+            if *attempts < 3 {
+                continue;
+            }
+            if let Some(candidate) =
+                select_automatic_candidate(storage, cluster, &topic.topic, current).await
+            {
+                let response = promote_leader(
+                    sevlamq_protocol::PromoteLeaderRequest {
+                        topic: topic.topic.clone(),
+                        partition: current.partition,
+                        leader_id: candidate,
+                    },
+                    storage,
+                    cluster,
+                )
+                .await?;
+                if let Response::LeadershipChanged(promoted) = response {
+                    metrics.automatic_leader_promotion();
+                    info!(
+                        topic = %topic.topic,
+                        partition = promoted.partition,
+                        previous_leader_id = current.leader_id,
+                        leader_id = promoted.leader_id,
+                        leader_epoch = promoted.leader_epoch,
+                        high_watermark = promoted.high_watermark,
+                        "partition leader promoted automatically"
+                    );
+                    failures.remove(&key);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn select_automatic_candidate(
+    storage: &StorageHandle,
+    cluster: &ClusterRuntime,
+    topic: &str,
+    current: sevlamq_protocol::PartitionLeadership,
+) -> Option<u32> {
+    let mut offsets = Vec::new();
+    for node in &cluster.metadata.nodes {
+        if node.id == current.leader_id
+            || !is_partition_replica(
+                &cluster.metadata,
+                node.id,
+                current.partition,
+                cluster.replicator.replication_factor,
+            )
+        {
+            continue;
+        }
+        let offset = if node.id == cluster.metadata.responding_broker_id {
+            storage
+                .partition_offset(topic, current.partition)
+                .await
+                .ok()
+        } else {
+            timeout(
+                Duration::from_millis(500),
+                query_partition_offset(node, topic, current.partition),
+            )
+            .await
+            .ok()
+            .flatten()
+        };
+        if let Some(offset) = offset {
+            offsets.push((node.id, offset));
+        }
+    }
+    choose_automatic_candidate(
+        offsets,
+        cluster.replicator.min_in_sync_replicas,
+        current.high_watermark,
+    )
+}
+
+fn choose_automatic_candidate(
+    offsets: Vec<(u32, u64)>,
+    min_in_sync_replicas: usize,
+    high_watermark: u64,
+) -> Option<u32> {
+    if offsets.len() < min_in_sync_replicas {
+        return None;
+    }
+    offsets
+        .into_iter()
+        .filter(|(_, offset)| *offset >= high_watermark)
+        .max_by_key(|(id, offset)| (*offset, std::cmp::Reverse(*id)))
+        .map(|(id, _)| id)
 }
 
 async fn sync_controller_metadata(
@@ -2744,8 +2921,9 @@ mod tests {
     use super::{
         ClusterRuntime, ConnectionError, GroupHandle, LeadershipRegistry, PartitionSnapshot,
         Replicator, RuntimeMetrics, StorageCommand, StorageHandle, StorageSettings,
-        handle_connection, leader_for_partition, leadership_error, process_request,
-        process_topic_request, render_metrics, select_partition, start_storage_worker,
+        choose_automatic_candidate, handle_connection, leader_for_partition, leadership_error,
+        process_request, process_topic_request, render_metrics, select_partition,
+        start_storage_worker,
     };
 
     fn test_storage_settings(data_dir: &std::path::Path, partitions: u32) -> StorageSettings {
@@ -2900,6 +3078,19 @@ mod tests {
         assert!(leadership_error(&cluster, Some(0)).is_none());
         assert!(leadership_error(&cluster, Some(1)).is_some());
         assert!(leadership_error(&cluster, None).is_some());
+    }
+
+    #[test]
+    fn selects_only_safe_automatic_promotion_candidates() {
+        assert_eq!(
+            choose_automatic_candidate(vec![(2, 12), (3, 13)], 2, 13),
+            Some(3)
+        );
+        assert_eq!(
+            choose_automatic_candidate(vec![(2, 12), (3, 12)], 2, 13),
+            None
+        );
+        assert_eq!(choose_automatic_candidate(vec![(3, 13)], 2, 13), None);
     }
 
     #[tokio::test]

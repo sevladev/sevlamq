@@ -78,6 +78,7 @@ pub struct RuntimeMetrics {
     replication_records_received: AtomicU64,
     replication_failures: AtomicU64,
     replication_reconnects: AtomicU64,
+    automatic_leader_promotions: AtomicU64,
     replica_offsets: Mutex<HashMap<(u32, String, u32), u64>>,
     replica_sync: Mutex<HashMap<(u32, String, u32), bool>>,
     in_sync_replicas: Mutex<HashMap<(u32, String, u32), bool>>,
@@ -160,6 +161,11 @@ impl RuntimeMetrics {
         if was_out_of_sync {
             self.replication_reconnects.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub fn automatic_leader_promotion(&self) {
+        self.automatic_leader_promotions
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn replica_sync(&self, leader_id: u32, topic: &str, partition: u32, in_sync: bool) {
@@ -310,6 +316,7 @@ impl RuntimeMetrics {
             "counter",
             self.replication_reconnects.load(Ordering::Relaxed),
         );
+        self.render_automatic_promotions(output);
         self.produce_latency.render(
             output,
             "sevlamq_produce_duration_seconds",
@@ -329,6 +336,16 @@ impl RuntimeMetrics {
             output,
             "sevlamq_flush_duration_seconds",
             "Durable storage synchronization latency.",
+        );
+    }
+
+    fn render_automatic_promotions(&self, output: &mut String) {
+        metric(
+            output,
+            "sevlamq_automatic_leader_promotions_total",
+            "Partition leaders promoted automatically after probe failures.",
+            "counter",
+            self.automatic_leader_promotions.load(Ordering::Relaxed),
         );
     }
 }
