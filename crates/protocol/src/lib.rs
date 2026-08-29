@@ -89,6 +89,7 @@ pub struct TopicMetadata {
     pub partitions: u32,
     pub leaders: Vec<u32>,
     pub leader_epochs: Vec<u64>,
+    pub high_watermarks: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +97,7 @@ pub struct PartitionLeadership {
     pub partition: u32,
     pub leader_id: u32,
     pub leader_epoch: u64,
+    pub high_watermark: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -747,6 +749,7 @@ pub fn encode_request(request: &Request, buffer: &mut BytesMut) -> Result<(), Pr
             request.partition,
             request.leader_id,
             0,
+            0,
             buffer,
         ),
         Request::ApplyLeadership(request) => encode_leadership_request(
@@ -755,6 +758,7 @@ pub fn encode_request(request: &Request, buffer: &mut BytesMut) -> Result<(), Pr
             request.leadership.partition,
             request.leadership.leader_id,
             request.leadership.leader_epoch,
+            request.leadership.high_watermark,
             buffer,
         ),
         Request::PartitionStatus(request) => {
@@ -822,11 +826,12 @@ pub fn encode_response(response: &Response, buffer: &mut BytesMut) -> Result<(),
         Response::Topics(topics) => encode_topics_response(topics, buffer),
         Response::ClusterMetadata(metadata) => encode_cluster_metadata(metadata, buffer),
         Response::LeadershipChanged(leadership) => {
-            buffer.put_u32(1 + 4 + 4 + 8);
+            buffer.put_u32(1 + 4 + 4 + 8 + 8);
             buffer.put_u8(LEADERSHIP_CHANGED);
             buffer.put_u32(leadership.partition);
             buffer.put_u32(leadership.leader_id);
             buffer.put_u64(leadership.leader_epoch);
+            buffer.put_u64(leadership.high_watermark);
             Ok(())
         }
         Response::PartitionStatus(next_offset) => {
@@ -888,6 +893,7 @@ fn encode_topics_response(
                     != usize::try_from(topic.partitions)
                         .map_err(|_| ProtocolError::InvalidPartitionCount)?)
             || topic.leader_epochs.len() != topic.leaders.len()
+            || topic.high_watermarks.len() != topic.leaders.len()
         {
             return Err(ProtocolError::InvalidPartitionCount);
         }
@@ -900,6 +906,9 @@ fn encode_topics_response(
         }
         for epoch in &topic.leader_epochs {
             buffer.put_u64(*epoch);
+        }
+        for high_watermark in &topic.high_watermarks {
+            buffer.put_u64(*high_watermark);
         }
     }
     set_frame_len(buffer, start)
@@ -1001,11 +1010,12 @@ fn decode_response_frame(
         CLUSTER_METADATA_RESPONSE => {
             decode_cluster_metadata(frame).map(|metadata| Some(Response::ClusterMetadata(metadata)))
         }
-        LEADERSHIP_CHANGED if frame.remaining() == 16 => {
+        LEADERSHIP_CHANGED if frame.remaining() == 24 => {
             Ok(Some(Response::LeadershipChanged(PartitionLeadership {
                 partition: frame.get_u32(),
                 leader_id: frame.get_u32(),
                 leader_epoch: frame.get_u64(),
+                high_watermark: frame.get_u64(),
             })))
         }
         PARTITION_STATUS_RESPONSE if frame.remaining() == 8 => {
@@ -1051,11 +1061,19 @@ fn decode_topics_response(mut frame: BytesMut) -> Result<Vec<TopicMetadata>, Pro
                 .ok_or(ProtocolError::InvalidFrame)?,
         )?;
         let leader_epochs = (0..leader_count).map(|_| frame.get_u64()).collect();
+        ensure_remaining(
+            &frame,
+            leader_count
+                .checked_mul(8)
+                .ok_or(ProtocolError::InvalidFrame)?,
+        )?;
+        let high_watermarks = (0..leader_count).map(|_| frame.get_u64()).collect();
         topics.push(TopicMetadata {
             topic,
             partitions,
             leaders,
             leader_epochs,
+            high_watermarks,
         });
     }
     ensure_empty(&frame)?;
@@ -1172,13 +1190,14 @@ fn decode_promote_leader(mut frame: BytesMut) -> Result<PromoteLeaderRequest, Pr
 
 fn decode_apply_leadership(mut frame: BytesMut) -> Result<ApplyLeadershipRequest, ProtocolError> {
     let topic = decode_string(&mut frame)?;
-    ensure_remaining(&frame, 16)?;
+    ensure_remaining(&frame, 24)?;
     let request = ApplyLeadershipRequest {
         topic,
         leadership: PartitionLeadership {
             partition: frame.get_u32(),
             leader_id: frame.get_u32(),
             leader_epoch: frame.get_u64(),
+            high_watermark: frame.get_u64(),
         },
     };
     ensure_empty(&frame)?;
@@ -1323,6 +1342,7 @@ fn encode_leadership_request(
     partition: u32,
     leader_id: u32,
     leader_epoch: u64,
+    high_watermark: u64,
     buffer: &mut BytesMut,
 ) -> Result<(), ProtocolError> {
     validate_topic(topic)?;
@@ -1334,6 +1354,7 @@ fn encode_leadership_request(
     buffer.put_u32(leader_id);
     if opcode == APPLY_LEADERSHIP {
         buffer.put_u64(leader_epoch);
+        buffer.put_u64(high_watermark);
     }
     set_frame_len(buffer, start)
 }
@@ -1888,6 +1909,7 @@ mod tests {
             partitions: 6,
             leaders: vec![1, 2, 3, 1, 2, 3],
             leader_epochs: vec![0, 0, 0, 0, 0, 0],
+            high_watermarks: vec![10, 20, 30, 40, 50, 60],
         }]);
         let mut encoded = BytesMut::new();
         encode_response(&response, &mut encoded).expect("topics response should encode");
@@ -1930,6 +1952,7 @@ mod tests {
             partition: 2,
             leader_id: 3,
             leader_epoch: 9,
+            high_watermark: 42,
         };
         for request in [
             Request::PromoteLeader(PromoteLeaderRequest {

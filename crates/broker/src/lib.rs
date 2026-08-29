@@ -109,6 +109,7 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
         .map_err(|_| BrokerError::StorageUnavailable)?
     {
         leadership.ensure_topic(&topic.topic, topic.partitions)?;
+        migrate_topic_high_watermarks(&storage, &leadership, &topic).await?;
         groups.set_topic_partitions(&topic.topic, topic.partitions)?;
     }
 
@@ -144,6 +145,21 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
     Ok(())
 }
 
+async fn migrate_topic_high_watermarks(
+    storage: &StorageHandle,
+    leadership: &LeadershipRegistry,
+    topic: &TopicMetadata,
+) -> Result<(), BrokerError> {
+    for partition in 0..topic.partitions {
+        let local_end = storage
+            .partition_offset(&topic.topic, partition)
+            .await
+            .map_err(|_| BrokerError::StorageUnavailable)?;
+        leadership.migrate_high_watermark(&topic.topic, partition, local_end)?;
+    }
+    Ok(())
+}
+
 async fn accept_connections(
     listener: &TcpListener,
     admin_listener: &TcpListener,
@@ -168,7 +184,7 @@ async fn accept_connections(
             }
             accepted = admin_listener.accept() => {
                 let (stream, _) = accepted?;
-                connections.spawn(handle_admin_connection(stream, storage.clone(), groups.clone(), Arc::clone(&metrics), Arc::clone(&cluster.metadata)));
+                connections.spawn(handle_admin_connection(stream, storage.clone(), groups.clone(), Arc::clone(&metrics), Arc::clone(&cluster.metadata), cluster.leadership.clone()));
             }
             accepted = replication_listener.accept() => {
                 let (stream, peer) = accepted?;
@@ -308,6 +324,14 @@ async fn process_request(
                     request.max_wait_ms(),
                 )
                 .await?;
+            let high_watermark = cluster
+                .leadership
+                .partition(request.topic(), request.partition())?
+                .high_watermark;
+            let records: Vec<_> = records
+                .into_iter()
+                .filter(|record| record.offset < high_watermark)
+                .collect();
             metrics.fetched(
                 records.len(),
                 records.iter().map(|record| record.value.len()).sum(),
@@ -320,7 +344,11 @@ async fn process_request(
             {
                 return Ok(error);
             }
-            let response = group_fetch(storage, groups, request).await?;
+            let high_watermark = cluster
+                .leadership
+                .partition(&request.topic, request.partition)?
+                .high_watermark;
+            let response = group_fetch(storage, groups, request, high_watermark).await?;
             if let Response::Fetch(fetch) = &response {
                 metrics.fetched(
                     fetch.records().len(),
@@ -442,6 +470,23 @@ async fn process_topic_request(
             .await
             .map(Response::PartitionStatus),
         Request::ApplyLeadership(request) => {
+            let current = cluster
+                .leadership
+                .partition(&request.topic, request.leadership.partition)?;
+            if request.leadership.leader_epoch > current.leader_epoch {
+                let local_offset = storage
+                    .partition_offset(&request.topic, request.leadership.partition)
+                    .await?;
+                if local_offset > request.leadership.high_watermark {
+                    storage
+                        .truncate(
+                            &request.topic,
+                            request.leadership.partition,
+                            request.leadership.high_watermark,
+                        )
+                        .await?;
+                }
+            }
             cluster
                 .leadership
                 .apply(&request.topic, request.leadership)?;
@@ -501,7 +546,7 @@ async fn promote_leader(
             "candidate is not a partition replica".to_owned(),
         ));
     }
-    verify_promotion_candidate(&request, storage, cluster).await?;
+    verify_promotion_candidate(&request, current.high_watermark, storage, cluster).await?;
     let leadership = sevlamq_protocol::PartitionLeadership {
         partition: request.partition,
         leader_id: request.leader_id,
@@ -509,7 +554,18 @@ async fn promote_leader(
             .leader_epoch
             .checked_add(1)
             .ok_or(ConnectionError::LeaderEpochOverflow)?,
+        high_watermark: current.high_watermark,
     };
+    if request.leader_id == cluster.metadata.responding_broker_id {
+        let local_offset = storage
+            .partition_offset(&request.topic, request.partition)
+            .await?;
+        if local_offset > leadership.high_watermark {
+            storage
+                .truncate(&request.topic, request.partition, leadership.high_watermark)
+                .await?;
+        }
+    }
     cluster.leadership.apply(&request.topic, leadership)?;
     broadcast_leadership(&request.topic, leadership, cluster).await;
     Ok(Response::LeadershipChanged(leadership))
@@ -517,6 +573,7 @@ async fn promote_leader(
 
 async fn verify_promotion_candidate(
     request: &sevlamq_protocol::PromoteLeaderRequest,
+    committed_high_watermark: u64,
     storage: &StorageHandle,
     cluster: &ClusterRuntime,
 ) -> Result<(), ConnectionError> {
@@ -548,7 +605,9 @@ async fn verify_promotion_candidate(
         .map(|(_, offset)| *offset)
         .ok_or(ConnectionError::PromotionCandidateUnavailable)?;
     let highest = offsets.iter().map(|(_, offset)| *offset).max().unwrap_or(0);
-    if offsets.len() < cluster.replicator.min_in_sync_replicas || candidate != highest {
+    if offsets.len() < cluster.replicator.min_in_sync_replicas
+        || candidate < committed_high_watermark
+    {
         return Err(ConnectionError::UnsafePromotion {
             candidate,
             highest,
@@ -600,6 +659,10 @@ fn with_leaders(
         .topic(&metadata.topic, metadata.partitions)?;
     metadata.leaders = leadership.iter().map(|entry| entry.leader_id).collect();
     metadata.leader_epochs = leadership.iter().map(|entry| entry.leader_epoch).collect();
+    metadata.high_watermarks = leadership
+        .iter()
+        .map(|entry| entry.high_watermark)
+        .collect();
     Ok(metadata)
 }
 
@@ -722,11 +785,47 @@ impl Replicator {
                 }
             }
         }
+        if acknowledgements >= self.min_in_sync_replicas {
+            self.commit(topic, partition, record.offset.saturating_add(1))
+                .await?;
+        }
         if ack_mode == AckMode::Durable && acknowledgements < self.min_in_sync_replicas {
             return Err(ConnectionError::NotEnoughInSyncReplicas {
                 required: self.min_in_sync_replicas,
                 available: acknowledgements,
             });
+        }
+        Ok(())
+    }
+
+    async fn commit(
+        &self,
+        topic: &str,
+        partition: u32,
+        high_watermark: u64,
+    ) -> Result<(), ConnectionError> {
+        let mut leadership = self.leadership.partition(topic, partition)?;
+        if high_watermark <= leadership.high_watermark {
+            return Ok(());
+        }
+        leadership.high_watermark = high_watermark;
+        self.leadership.apply(topic, leadership)?;
+        for node in &self.cluster.nodes {
+            if node.id == self.cluster.responding_broker_id {
+                continue;
+            }
+            let Ok(address) = format!("{}:{}", node.host, node.port).parse() else {
+                continue;
+            };
+            let Ok(mut client) = Client::connect(address).await else {
+                continue;
+            };
+            if let Err(error) = client
+                .apply_leadership(address, topic.to_owned(), leadership)
+                .await
+            {
+                debug!(%error, broker_id = node.id, %topic, partition, "high watermark broadcast deferred");
+            }
         }
         Ok(())
     }
@@ -893,22 +992,26 @@ async fn sync_controller_metadata(
                 .await?;
         }
         leadership.ensure_topic(&topic.topic, topic.partitions)?;
-        for ((partition, leader_id), leader_epoch) in topic
+        for (((partition, leader_id), leader_epoch), high_watermark) in topic
             .leaders
             .into_iter()
             .enumerate()
             .zip(topic.leader_epochs)
+            .zip(topic.high_watermarks)
         {
             let partition =
                 u32::try_from(partition).map_err(|_| ConnectionError::InvalidClusterMetadata)?;
             let current = leadership.partition(&topic.topic, partition)?;
-            if leader_epoch > current.leader_epoch {
+            if leader_epoch > current.leader_epoch
+                || (leader_epoch == current.leader_epoch && high_watermark > current.high_watermark)
+            {
                 leadership.apply(
                     &topic.topic,
                     sevlamq_protocol::PartitionLeadership {
                         partition,
                         leader_id,
                         leader_epoch,
+                        high_watermark,
                     },
                 )?;
             }
@@ -1050,6 +1153,7 @@ async fn handle_replication_connection(
                         partition: record.partition,
                         leader_id: record.leader_id,
                         leader_epoch: record.leader_epoch,
+                        high_watermark: current.high_watermark,
                     },
                 )?;
             }
@@ -1174,6 +1278,7 @@ async fn group_fetch(
     storage: &StorageHandle,
     groups: &GroupHandle,
     request: GroupFetchRequest,
+    high_watermark: u64,
 ) -> Result<Response, ConnectionError> {
     match groups.execute(Request::GroupFetch(request.clone())).await {
         Response::GroupAck => storage
@@ -1185,7 +1290,14 @@ async fn group_fetch(
                 request.max_wait_ms,
             )
             .await
-            .map(|records| Response::Fetch(FetchResponse::new(records))),
+            .map(|records| {
+                Response::Fetch(FetchResponse::new(
+                    records
+                        .into_iter()
+                        .filter(|record| record.offset < high_watermark)
+                        .collect(),
+                ))
+            }),
         error @ Response::Error(_) => Ok(error),
         _ => Ok(Response::Error(
             "invalid group authorization response".to_owned(),
@@ -1199,6 +1311,7 @@ async fn handle_admin_connection(
     groups: GroupHandle,
     metrics: Arc<RuntimeMetrics>,
     cluster: Arc<ClusterMetadata>,
+    leadership: LeadershipRegistry,
 ) -> Result<(), ConnectionError> {
     const MAX_REQUEST_BYTES: usize = 8 * 1024;
     let mut request = BytesMut::with_capacity(1024);
@@ -1241,7 +1354,12 @@ async fn handle_admin_connection(
         }
         Some("/metrics") => {
             let queue_depth = storage.queue_depth();
-            let partitions = storage.snapshot().await?;
+            let mut partitions = storage.snapshot().await?;
+            for partition in &mut partitions {
+                if let Ok(current) = leadership.partition(&partition.topic, partition.partition) {
+                    partition.high_watermark = current.high_watermark;
+                }
+            }
             let group_snapshots = groups.snapshot().await?;
             let body = render_metrics(
                 &metrics,
@@ -1398,6 +1516,8 @@ fn render_partition_metrics(output: &mut String, partitions: &[PartitionSnapshot
     use std::fmt::Write as _;
     output.push_str("# HELP sevlamq_partition_high_watermark Next offset of a partition.\n");
     output.push_str("# TYPE sevlamq_partition_high_watermark gauge\n");
+    output.push_str("# HELP sevlamq_partition_log_end_offset Next locally stored offset.\n");
+    output.push_str("# TYPE sevlamq_partition_log_end_offset gauge\n");
     output.push_str("# HELP sevlamq_partition_low_watermark Earliest available offset.\n");
     output.push_str("# TYPE sevlamq_partition_low_watermark gauge\n");
     output
@@ -1414,6 +1534,11 @@ fn render_partition_metrics(output: &mut String, partitions: &[PartitionSnapshot
             output,
             "sevlamq_partition_high_watermark{{{labels}}} {}",
             snapshot.high_watermark
+        );
+        let _ = writeln!(
+            output,
+            "sevlamq_partition_log_end_offset{{{labels}}} {}",
+            snapshot.log_end_offset
         );
         let _ = writeln!(
             output,
@@ -1680,6 +1805,7 @@ struct PartitionSnapshot {
     topic: String,
     partition: u32,
     high_watermark: u64,
+    log_end_offset: u64,
     low_watermark: u64,
     log_size_bytes: u64,
     segments: usize,
@@ -2160,6 +2286,7 @@ fn storage_topic_metadata(topics: &HashMap<String, u32>) -> Vec<TopicMetadata> {
             partitions: *partitions,
             leaders: Vec::new(),
             leader_epochs: Vec::new(),
+            high_watermarks: Vec::new(),
         })
         .collect();
     metadata.sort_unstable_by(|left, right| left.topic.cmp(&right.topic));
@@ -2173,6 +2300,7 @@ fn snapshot_logs(logs: &PartitionLogs) -> Vec<PartitionSnapshot> {
             topic: topic.clone(),
             partition: *partition,
             high_watermark: log.next_offset(),
+            log_end_offset: log.next_offset(),
             low_watermark: log.low_watermark(),
             log_size_bytes: log.log_size_bytes(),
             segments: log.segments().len(),
@@ -2418,6 +2546,7 @@ fn create_topic(
         partitions,
         leaders: Vec::new(),
         leader_epochs: Vec::new(),
+        high_watermarks: Vec::new(),
     })
 }
 
@@ -2600,7 +2729,10 @@ mod tests {
 
     use bytes::Bytes;
     use sevlamq_client::Client;
-    use sevlamq_protocol::{AckMode, BatchRecord, ClusterMetadata, ClusterNode};
+    use sevlamq_protocol::{
+        AckMode, BatchRecord, ClusterMetadata, ClusterNode, FetchRequest, PartitionLeadership,
+        PromoteLeaderRequest, Request, Response,
+    };
     use sevlamq_storage::{PartitionLog, Record};
     use tempfile::tempdir;
     use tokio::{
@@ -2612,8 +2744,8 @@ mod tests {
     use super::{
         ClusterRuntime, ConnectionError, GroupHandle, LeadershipRegistry, PartitionSnapshot,
         Replicator, RuntimeMetrics, StorageCommand, StorageHandle, StorageSettings,
-        handle_connection, leader_for_partition, leadership_error, render_metrics,
-        select_partition, start_storage_worker,
+        handle_connection, leader_for_partition, leadership_error, process_request,
+        process_topic_request, render_metrics, select_partition, start_storage_worker,
     };
 
     fn test_storage_settings(data_dir: &std::path::Path, partitions: u32) -> StorageSettings {
@@ -2742,6 +2874,20 @@ mod tests {
         ));
     }
 
+    async fn append_to_partition(storage: &StorageHandle, value: &'static [u8]) {
+        storage
+            .append(
+                "payments".to_owned(),
+                Some(0),
+                Bytes::new(),
+                Bytes::from_static(value),
+                AckMode::Durable,
+                None,
+            )
+            .await
+            .expect("test record should append");
+    }
+
     #[test]
     fn assigns_partition_leaders_deterministically() {
         let cluster = three_node_cluster();
@@ -2756,6 +2902,106 @@ mod tests {
         assert!(leadership_error(&cluster, None).is_some());
     }
 
+    #[tokio::test]
+    async fn hides_locally_appended_records_beyond_the_high_watermark() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let (storage, worker) = start_storage_worker(
+            test_storage_settings(data_dir.path(), 3),
+            Arc::new(RuntimeMetrics::default()),
+        )
+        .await
+        .expect("storage worker should start");
+        append_to_partition(&storage, b"not-committed").await;
+        let groups = GroupHandle::open(data_dir.path(), 3, Duration::from_secs(10))
+            .expect("group coordinator should start");
+        let cluster = test_cluster_runtime(data_dir.path(), test_cluster(), 1, 1);
+        let request = Request::Fetch(
+            FetchRequest::new("payments".to_owned(), 0, 0, 1024, 0)
+                .expect("fetch request should be valid"),
+        );
+
+        let response = process_request(
+            request,
+            &storage,
+            &groups,
+            &RuntimeMetrics::default(),
+            1,
+            "127.0.0.1:1".parse().expect("peer should parse"),
+            &cluster,
+        )
+        .await
+        .expect("fetch should succeed");
+
+        assert!(matches!(response, Response::Fetch(fetch) if fetch.records().is_empty()));
+        drop(storage);
+        worker
+            .await
+            .expect("storage worker should finish")
+            .expect("storage should close cleanly");
+    }
+
+    #[tokio::test]
+    async fn promotion_truncates_the_uncommitted_tail_to_the_high_watermark() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let (storage, worker) = start_storage_worker(
+            test_storage_settings(data_dir.path(), 3),
+            Arc::new(RuntimeMetrics::default()),
+        )
+        .await
+        .expect("storage worker should start");
+        append_to_partition(&storage, b"committed").await;
+        append_to_partition(&storage, b"not-committed").await;
+        let groups = GroupHandle::open(data_dir.path(), 3, Duration::from_secs(10))
+            .expect("group coordinator should start");
+        let cluster = test_cluster_runtime(data_dir.path(), test_cluster(), 1, 1);
+        cluster
+            .leadership
+            .apply(
+                "payments",
+                PartitionLeadership {
+                    partition: 0,
+                    leader_id: 1,
+                    leader_epoch: 0,
+                    high_watermark: 1,
+                },
+            )
+            .expect("committed watermark should advance");
+
+        let response = process_topic_request(
+            Request::PromoteLeader(PromoteLeaderRequest {
+                topic: "payments".to_owned(),
+                partition: 0,
+                leader_id: 1,
+            }),
+            &storage,
+            &groups,
+            &cluster,
+        )
+        .await
+        .expect("promotion should succeed");
+
+        assert!(matches!(
+            response,
+            Response::LeadershipChanged(PartitionLeadership {
+                leader_epoch: 1,
+                high_watermark: 1,
+                ..
+            })
+        ));
+        assert_eq!(
+            storage
+                .partition_offset("payments", 0)
+                .await
+                .expect("partition offset should be readable"),
+            1
+        );
+        drop(storage);
+        worker
+            .await
+            .expect("storage worker should finish")
+            .expect("storage should close cleanly");
+    }
+
     #[test]
     fn renders_partition_and_consumer_group_lag_metrics() {
         let metrics = RuntimeMetrics::default();
@@ -2767,6 +3013,7 @@ mod tests {
             topic: "payments".to_owned(),
             partition: 0,
             high_watermark: 13,
+            log_end_offset: 15,
             low_watermark: 0,
             log_size_bytes: 512,
             segments: 2,
@@ -3059,6 +3306,13 @@ mod tests {
             .expect("follower records should be readable");
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].offset, 2);
+        assert_eq!(
+            leader_leadership
+                .partition("payments", 0)
+                .expect("committed partition should exist")
+                .high_watermark,
+            3
+        );
 
         let without_followers = test_replicator(cluster, leader_leadership, 3, 2);
         assert_rejects_without_quorum(&without_followers, &leader, &latest).await;

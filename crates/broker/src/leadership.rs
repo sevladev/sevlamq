@@ -53,6 +53,7 @@ impl LeadershipRegistry {
                     partition,
                     leader_id: deterministic_leader(&self.inner.cluster, partition),
                     leader_epoch: 0,
+                    high_watermark: 0,
                 });
                 changed = true;
             }
@@ -118,13 +119,42 @@ impl LeadershipRegistry {
             .write()
             .map_err(|_| LeadershipError::Poisoned)?;
         let key = (topic.to_owned(), leadership.partition);
-        if entries
-            .get(&key)
-            .is_some_and(|current| leadership.leader_epoch <= current.leader_epoch)
-        {
-            return Err(LeadershipError::StaleEpoch);
+        if let Some(current) = entries.get(&key) {
+            if leadership.leader_epoch < current.leader_epoch
+                || (leadership.leader_epoch == current.leader_epoch
+                    && (leadership.leader_id != current.leader_id
+                        || leadership.high_watermark < current.high_watermark))
+            {
+                return Err(LeadershipError::StaleEpoch);
+            }
+            if leadership == *current {
+                return Ok(());
+            }
         }
         entries.insert(key, leadership);
+        let result = persist_entries(&self.inner.path, &entries);
+        drop(entries);
+        result
+    }
+
+    pub fn migrate_high_watermark(
+        &self,
+        topic: &str,
+        partition: u32,
+        high_watermark: u64,
+    ) -> Result<(), LeadershipError> {
+        let mut entries = self
+            .inner
+            .entries
+            .write()
+            .map_err(|_| LeadershipError::Poisoned)?;
+        let entry = entries
+            .get_mut(&(topic.to_owned(), partition))
+            .ok_or(LeadershipError::MissingPartition(partition))?;
+        if entry.high_watermark != u64::MAX {
+            return Ok(());
+        }
+        entry.high_watermark = high_watermark;
         let result = persist_entries(&self.inner.path, &entries);
         drop(entries);
         result
@@ -158,6 +188,10 @@ fn parse_entries(
             .ok_or(LeadershipError::InvalidMetadata)?
             .parse()
             .map_err(|_| LeadershipError::InvalidMetadata)?;
+        let high_watermark = fields
+            .next()
+            .map_or(Ok(u64::MAX), str::parse)
+            .map_err(|_| LeadershipError::InvalidMetadata)?;
         if fields.next().is_some() {
             return Err(LeadershipError::InvalidMetadata);
         }
@@ -167,6 +201,7 @@ fn parse_entries(
                 partition,
                 leader_id,
                 leader_epoch,
+                high_watermark,
             },
         );
     }
@@ -184,8 +219,11 @@ fn persist_entries(
     for ((topic, _), leadership) in ordered {
         writeln!(
             file,
-            "{topic}\t{}\t{}\t{}",
-            leadership.partition, leadership.leader_id, leadership.leader_epoch
+            "{topic}\t{}\t{}\t{}\t{}",
+            leadership.partition,
+            leadership.leader_id,
+            leadership.leader_epoch,
+            leadership.high_watermark
         )?;
     }
     file.sync_all()?;
@@ -253,14 +291,29 @@ mod tests {
             partition: 1,
             leader_id: 3,
             leader_epoch: 1,
+            high_watermark: 7,
         };
         registry
             .apply("payments", promoted)
             .expect("new epoch should be accepted");
+        registry
+            .apply("payments", promoted)
+            .expect("reapplying identical metadata should be idempotent");
+        let stale = PartitionLeadership {
+            high_watermark: 6,
+            ..promoted
+        };
         assert!(matches!(
-            registry.apply("payments", promoted),
+            registry.apply("payments", stale),
             Err(LeadershipError::StaleEpoch)
         ));
+        let committed = PartitionLeadership {
+            high_watermark: 8,
+            ..promoted
+        };
+        registry
+            .apply("payments", committed)
+            .expect("high watermark should advance within an epoch");
 
         let reopened =
             LeadershipRegistry::open(directory.path(), cluster()).expect("registry should reopen");
@@ -268,7 +321,7 @@ mod tests {
             reopened
                 .partition("payments", 1)
                 .expect("promoted partition should persist"),
-            promoted
+            committed
         );
     }
 }

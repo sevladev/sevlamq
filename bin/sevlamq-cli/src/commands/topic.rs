@@ -30,7 +30,12 @@ fn print_topic(topic: &sevlamq_protocol::TopicMetadata) {
                 .get(partition)
                 .copied()
                 .unwrap_or_default();
-            format!("{partition}:{leader}@{epoch}")
+            let high_watermark = topic
+                .high_watermarks
+                .get(partition)
+                .copied()
+                .unwrap_or_default();
+            format!("{partition}:{leader}@{epoch}/hw={high_watermark}")
         })
         .collect::<Vec<_>>()
         .join(",");
