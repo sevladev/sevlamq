@@ -10,10 +10,11 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use sevlamq_common::{AdminConfig, BrokerConfig};
+use sevlamq_common::Config;
 use sevlamq_protocol::{
-    AckMode, BatchRecord, FetchResponse, FetchedRecord, GroupFetchRequest, ProduceAck, Request,
-    Response, TopicMetadata, decode_request, encode_response,
+    AckMode, BatchRecord, ClusterMetadata, ClusterNode, FetchResponse, FetchedRecord,
+    GroupFetchRequest, ProduceAck, Request, Response, TopicMetadata, decode_request,
+    encode_response,
 };
 use sevlamq_storage::{
     PartitionLog, ProducerIdentity as StorageProducerIdentity, Record, discover_partitions,
@@ -36,30 +37,46 @@ use observability::RuntimeMetrics;
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
-pub async fn run(config: &BrokerConfig, admin_config: &AdminConfig) -> Result<(), BrokerError> {
-    let address = config.socket_addr()?;
+pub async fn run(config: &Config) -> Result<(), BrokerError> {
+    let broker_config = &config.broker;
+    let address = broker_config.socket_addr()?;
+    let cluster = Arc::new(ClusterMetadata {
+        responding_broker_id: config.cluster.broker_id,
+        nodes: config
+            .cluster_nodes()?
+            .into_iter()
+            .map(|node| ClusterNode {
+                id: node.id,
+                host: node.host,
+                port: node.port,
+                admin_port: node.admin_port,
+                replication_port: node.replication_port,
+            })
+            .collect(),
+    });
     let metrics = Arc::new(RuntimeMetrics::default());
     let storage_settings = StorageSettings {
-        data_dir: PathBuf::from(&config.data_dir),
-        max_segment_bytes: config.max_segment_bytes,
-        index_interval_bytes: config.index_interval_bytes,
-        default_partition_count: config.default_partition_count,
-        retention_bytes: (config.retention_bytes > 0).then_some(config.retention_bytes),
-        retention_age: (config.retention_ms > 0)
-            .then(|| Duration::from_millis(config.retention_ms)),
-        auto_create_topics: config.auto_create_topics,
-        queue_capacity: config.storage_queue_capacity,
-        enqueue_timeout: Duration::from_millis(config.storage_enqueue_timeout_ms),
+        data_dir: PathBuf::from(&broker_config.data_dir),
+        max_segment_bytes: broker_config.max_segment_bytes,
+        index_interval_bytes: broker_config.index_interval_bytes,
+        default_partition_count: broker_config.default_partition_count,
+        retention_bytes: (broker_config.retention_bytes > 0)
+            .then_some(broker_config.retention_bytes),
+        retention_age: (broker_config.retention_ms > 0)
+            .then(|| Duration::from_millis(broker_config.retention_ms)),
+        auto_create_topics: broker_config.auto_create_topics,
+        queue_capacity: broker_config.storage_queue_capacity,
+        enqueue_timeout: Duration::from_millis(broker_config.storage_enqueue_timeout_ms),
     };
     let (storage, storage_worker) =
         start_storage_worker(storage_settings, Arc::clone(&metrics)).await?;
     let listener = TcpListener::bind(address).await?;
-    let admin_address = admin_config.socket_addr()?;
+    let admin_address = config.admin.socket_addr()?;
     let admin_listener = TcpListener::bind(admin_address).await?;
     let groups = GroupHandle::open(
-        Path::new(&config.data_dir),
-        config.default_partition_count,
-        Duration::from_millis(config.group_session_timeout_ms),
+        Path::new(&broker_config.data_dir),
+        broker_config.default_partition_count,
+        Duration::from_millis(broker_config.group_session_timeout_ms),
     )?;
     for topic in storage
         .list_topics()
@@ -69,8 +86,16 @@ pub async fn run(config: &BrokerConfig, admin_config: &AdminConfig) -> Result<()
         groups.set_topic_partitions(&topic.topic, topic.partitions)?;
     }
 
-    info!(%address, %admin_address, data_dir = %config.data_dir, "broker started");
-    accept_connections(&listener, &admin_listener, storage.clone(), groups, metrics).await?;
+    info!(broker_id = cluster.responding_broker_id, %address, %admin_address, data_dir = %broker_config.data_dir, "broker started");
+    accept_connections(
+        &listener,
+        &admin_listener,
+        storage.clone(),
+        groups,
+        metrics,
+        cluster,
+    )
+    .await?;
     info!("shutdown signal received");
 
     drop(storage);
@@ -86,6 +111,7 @@ async fn accept_connections(
     storage: StorageHandle,
     groups: GroupHandle,
     metrics: Arc<RuntimeMetrics>,
+    cluster: Arc<ClusterMetadata>,
 ) -> Result<(), BrokerError> {
     let mut connections = JoinSet::new();
 
@@ -98,11 +124,11 @@ async fn accept_connections(
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
                 let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-                connections.spawn(handle_connection(stream, peer, connection_id, storage.clone(), groups.clone(), Arc::clone(&metrics)));
+                connections.spawn(handle_connection(stream, peer, connection_id, storage.clone(), groups.clone(), Arc::clone(&metrics), Arc::clone(&cluster)));
             }
             accepted = admin_listener.accept() => {
                 let (stream, _) = accepted?;
-                connections.spawn(handle_admin_connection(stream, storage.clone(), groups.clone(), Arc::clone(&metrics)));
+                connections.spawn(handle_admin_connection(stream, storage.clone(), groups.clone(), Arc::clone(&metrics), Arc::clone(&cluster)));
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 report_connection_result(result);
@@ -124,6 +150,7 @@ async fn handle_connection(
     storage: StorageHandle,
     groups: GroupHandle,
     metrics: Arc<RuntimeMetrics>,
+    cluster: Arc<ClusterMetadata>,
 ) -> Result<(), ConnectionError> {
     let mut read_buffer = BytesMut::with_capacity(8 * 1024);
     let mut write_buffer = BytesMut::with_capacity(128);
@@ -147,18 +174,25 @@ async fn handle_connection(
                 _ => None,
             };
             let started = Instant::now();
-            let response =
-                match process_request(request, &storage, &groups, &metrics, connection_id, peer)
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(ConnectionError::BrokerBusy) => {
-                        metrics.broker_busy();
-                        Response::Error("broker busy: storage queue timeout".to_owned())
-                    }
-                    Err(ConnectionError::Storage(error)) => Response::Error(error.to_string()),
-                    Err(error) => return Err(error),
-                };
+            let response = match process_request(
+                request,
+                &storage,
+                &groups,
+                &metrics,
+                connection_id,
+                peer,
+                &cluster,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(ConnectionError::BrokerBusy) => {
+                    metrics.broker_busy();
+                    Response::Error("broker busy: storage queue timeout".to_owned())
+                }
+                Err(ConnectionError::Storage(error)) => Response::Error(error.to_string()),
+                Err(error) => return Err(error),
+            };
             match operation {
                 Some("produce") => metrics.observe_produce(started.elapsed()),
                 Some("fetch") => metrics.observe_fetch(started.elapsed()),
@@ -181,6 +215,7 @@ async fn process_request(
     metrics: &RuntimeMetrics,
     connection_id: u64,
     peer: SocketAddr,
+    cluster: &ClusterMetadata,
 ) -> Result<Response, ConnectionError> {
     match request {
         Request::Produce(request) => {
@@ -268,6 +303,7 @@ async fn process_request(
             Err(ConnectionError::Storage(error)) => Ok(Response::Error(error.to_string())),
             Err(error) => Err(error),
         },
+        Request::ClusterMetadata => Ok(Response::ClusterMetadata(cluster.clone())),
     }
 }
 
@@ -331,6 +367,7 @@ async fn handle_admin_connection(
     storage: StorageHandle,
     groups: GroupHandle,
     metrics: Arc<RuntimeMetrics>,
+    cluster: Arc<ClusterMetadata>,
 ) -> Result<(), ConnectionError> {
     const MAX_REQUEST_BYTES: usize = 8 * 1024;
     let mut request = BytesMut::with_capacity(1024);
@@ -375,7 +412,13 @@ async fn handle_admin_connection(
             let queue_depth = storage.queue_depth();
             let partitions = storage.snapshot().await?;
             let group_snapshots = groups.snapshot().await?;
-            let body = render_metrics(&metrics, queue_depth, &partitions, &group_snapshots);
+            let body = render_metrics(
+                &metrics,
+                queue_depth,
+                &partitions,
+                &group_snapshots,
+                &cluster,
+            );
             write_http_response(
                 &mut stream,
                 "200 OK",
@@ -408,10 +451,22 @@ fn render_metrics(
     storage_queue_depth: usize,
     partitions: &[PartitionSnapshot],
     groups: &[groups::GroupSnapshot],
+    cluster: &ClusterMetadata,
 ) -> String {
     use std::fmt::Write as _;
     let mut output = String::with_capacity(8 * 1024);
     metrics.render(&mut output);
+    output.push_str("# HELP sevlamq_broker_info Static broker identity and endpoint.\n");
+    output.push_str("# TYPE sevlamq_broker_info gauge\n");
+    for node in &cluster.nodes {
+        let host = observability::escape_label(&node.host);
+        let current = u8::from(node.id == cluster.responding_broker_id);
+        let _ = writeln!(
+            output,
+            "sevlamq_broker_info{{broker_id=\"{}\",host=\"{host}\",port=\"{}\",current=\"{current}\"}} 1",
+            node.id, node.port
+        );
+    }
     output.push_str(
         "# HELP sevlamq_storage_queue_depth Commands waiting in the storage worker queue.\n",
     );
@@ -722,7 +777,8 @@ fn execute_group_request(
         | Request::Fetch(_)
         | Request::CreateTopic(_)
         | Request::ListTopics
-        | Request::DescribeTopic(_) => {
+        | Request::DescribeTopic(_)
+        | Request::ClusterMetadata => {
             unreachable!("group requests are filtered")
         }
     }
@@ -1455,7 +1511,7 @@ mod tests {
 
     use bytes::Bytes;
     use sevlamq_client::Client;
-    use sevlamq_protocol::{AckMode, BatchRecord};
+    use sevlamq_protocol::{AckMode, BatchRecord, ClusterMetadata, ClusterNode};
     use sevlamq_storage::{PartitionLog, Record};
     use tempfile::tempdir;
     use tokio::{
@@ -1484,6 +1540,19 @@ mod tests {
         }
     }
 
+    fn test_cluster() -> Arc<ClusterMetadata> {
+        Arc::new(ClusterMetadata {
+            responding_broker_id: 1,
+            nodes: vec![ClusterNode {
+                id: 1,
+                host: "127.0.0.1".to_owned(),
+                port: 7400,
+                admin_port: 7401,
+                replication_port: 7500,
+            }],
+        })
+    }
+
     #[test]
     fn renders_partition_and_consumer_group_lag_metrics() {
         let metrics = RuntimeMetrics::default();
@@ -1508,7 +1577,7 @@ mod tests {
             committed_offsets: vec![(0, 8)],
         }];
 
-        let rendered = render_metrics(&metrics, 0, &partitions, &groups);
+        let rendered = render_metrics(&metrics, 0, &partitions, &groups, &test_cluster());
 
         assert!(rendered.contains("sevlamq_messages_produced_total 2"));
         assert!(rendered.contains("sevlamq_broker_busy_total 1"));
@@ -1753,6 +1822,7 @@ mod tests {
                     connection_storage,
                     groups,
                     Arc::new(RuntimeMetrics::default()),
+                    test_cluster(),
                 )
                 .await
             });

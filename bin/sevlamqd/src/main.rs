@@ -12,7 +12,7 @@ async fn main() -> Result<(), AppError> {
     let config = Config::from_file(config_path)?;
     init_tracing(config.logging.json);
 
-    sevlamq_broker::run(&config.broker, &config.admin).await?;
+    sevlamq_broker::run(&config).await?;
     Ok(())
 }
 

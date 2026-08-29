@@ -10,6 +10,33 @@ pub struct Config {
     pub admin: AdminConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ClusterConfig {
+    pub broker_id: u32,
+    #[serde(default)]
+    pub nodes: Vec<ClusterNodeConfig>,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            broker_id: 1,
+            nodes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ClusterNodeConfig {
+    pub id: u32,
+    pub host: String,
+    pub port: u16,
+    pub admin_port: u16,
+    pub replication_port: u16,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -53,6 +80,41 @@ impl Config {
         let contents = fs::read_to_string(path).map_err(ConfigError::Read)?;
         toml::from_str(&contents).map_err(ConfigError::Parse)
     }
+
+    pub fn cluster_nodes(&self) -> Result<Vec<ClusterNodeConfig>, ConfigError> {
+        let nodes = if self.cluster.nodes.is_empty() {
+            vec![ClusterNodeConfig {
+                id: self.cluster.broker_id,
+                host: self.broker.host.clone(),
+                port: self.broker.port,
+                admin_port: self.admin.port,
+                replication_port: self
+                    .broker
+                    .port
+                    .checked_add(100)
+                    .ok_or(ConfigError::InvalidCluster)?,
+            }]
+        } else {
+            self.cluster.nodes.clone()
+        };
+        let mut ids = std::collections::HashSet::new();
+        let mut endpoints = std::collections::HashSet::new();
+        for node in &nodes {
+            if node.id == 0
+                || !ids.insert(node.id)
+                || !endpoints.insert((node.host.clone(), node.port))
+                || format!("{}:{}", node.host, node.port)
+                    .parse::<SocketAddr>()
+                    .is_err()
+            {
+                return Err(ConfigError::InvalidCluster);
+            }
+        }
+        if !ids.contains(&self.cluster.broker_id) {
+            return Err(ConfigError::LocalBrokerMissing);
+        }
+        Ok(nodes)
+    }
 }
 
 impl BrokerConfig {
@@ -81,12 +143,16 @@ pub enum ConfigError {
     Address(std::net::AddrParseError),
     #[error("invalid administrative address: {0}")]
     AdminAddress(std::net::AddrParseError),
+    #[error("cluster nodes contain an invalid or duplicate id/address")]
+    InvalidCluster,
+    #[error("local broker_id is not present in cluster nodes")]
+    LocalBrokerMissing,
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::Config;
+    use super::{ClusterConfig, ClusterNodeConfig, Config, ConfigError};
 
     #[test]
     fn parses_broker_configuration() {
@@ -123,9 +189,54 @@ mod tests {
         assert!(config.broker.auto_create_topics);
         assert_eq!(config.admin, super::AdminConfig::default());
         assert_eq!(config.logging, super::LoggingConfig::default());
+        assert_eq!(config.cluster, super::ClusterConfig::default());
+        assert_eq!(
+            config
+                .cluster_nodes()
+                .expect("cluster should validate")
+                .len(),
+            1
+        );
         assert_eq!(
             config.broker.socket_addr().expect("address should parse"),
             "127.0.0.1:7400".parse().expect("test address should parse")
         );
+    }
+
+    #[test]
+    fn validates_static_cluster_membership() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [broker]
+                host = "127.0.0.1"
+                port = 7400
+                data_dir = "./data"
+                max_segment_bytes = 1024
+                index_interval_bytes = 64
+                default_partition_count = 3
+                group_session_timeout_ms = 10000
+                retention_bytes = 0
+                retention_ms = 0
+                storage_queue_capacity = 16
+                storage_enqueue_timeout_ms = 100
+                auto_create_topics = false
+            "#,
+        )
+        .expect("configuration should parse");
+        config.cluster = ClusterConfig {
+            broker_id: 2,
+            nodes: vec![ClusterNodeConfig {
+                id: 1,
+                host: "127.0.0.1".to_owned(),
+                port: 7400,
+                admin_port: 7401,
+                replication_port: 7402,
+            }],
+        };
+
+        assert!(matches!(
+            config.cluster_nodes(),
+            Err(ConfigError::LocalBrokerMissing)
+        ));
     }
 }

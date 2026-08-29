@@ -1,0 +1,45 @@
+[broker]
+host = "127.0.0.1"
+port = 7600
+data_dir = "./data/broker-3"
+max_segment_bytes = 268435456
+index_interval_bytes = 4096
+default_partition_count = 3
+group_session_timeout_ms = 10000
+retention_bytes = 1073741824
+retention_ms = 604800000
+storage_queue_capacity = 1024
+storage_enqueue_timeout_ms = 100
+auto_create_topics = false
+
+[admin]
+host = "127.0.0.1"
+port = 7601
+
+[logging]
+json = false
+
+[cluster]
+broker_id = 3
+
+[[cluster.nodes]]
+id = 1
+host = "127.0.0.1"
+port = 7400
+admin_port = 7401
+replication_port = 7402
+
+[[cluster.nodes]]
+id = 2
+host = "127.0.0.1"
+port = 7500
+admin_port = 7501
+replication_port = 7502
+
+[[cluster.nodes]]
+id = 3
+host = "127.0.0.1"
+port = 7600
+admin_port = 7601
+replication_port = 7602
+

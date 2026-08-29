@@ -5,6 +5,7 @@ use crate::{
     error::CliError,
 };
 
+mod cluster;
 mod consume;
 mod fetch;
 mod group;
@@ -99,6 +100,7 @@ async fn execute_single(broker: std::net::SocketAddr, command: Command) -> Resul
         } => fetch::execute(&mut client, topic, partition, offset, max_bytes, wait_ms).await,
         Command::Group { command } => group::execute(&mut client, command).await,
         Command::Topic { command } => topic::execute(&mut client, command).await,
+        Command::Cluster { command } => cluster::execute(&mut client, command).await,
         Command::Consume { .. } => unreachable!("consume has a dedicated execution path"),
     }
 }

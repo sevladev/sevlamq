@@ -9,6 +9,7 @@ pub const MAX_BATCH_MESSAGES: usize = 1_000;
 pub const MAX_UNCOMPRESSED_BATCH_SIZE: usize = 3 * 1024 * 1024;
 pub const MAX_FETCH_BYTES: usize = 3 * 1024 * 1024;
 pub const MAX_FETCH_WAIT_MS: u32 = 30_000;
+pub const MAX_CLUSTER_NODES: usize = 1_024;
 
 const FRAME_HEADER_SIZE: usize = size_of::<u32>();
 const PRODUCE: u8 = 0x01;
@@ -31,6 +32,8 @@ const CREATE_TOPIC: u8 = 0x30;
 const LIST_TOPICS: u8 = 0x31;
 const DESCRIBE_TOPIC: u8 = 0x32;
 const TOPICS_RESPONSE: u8 = 0x33;
+const CLUSTER_METADATA: u8 = 0x40;
+const CLUSTER_METADATA_RESPONSE: u8 = 0x41;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -46,6 +49,22 @@ pub enum Request {
     CreateTopic(CreateTopicRequest),
     ListTopics,
     DescribeTopic(String),
+    ClusterMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterMetadata {
+    pub responding_broker_id: u32,
+    pub nodes: Vec<ClusterNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterNode {
+    pub id: u32,
+    pub host: String,
+    pub port: u16,
+    pub admin_port: u16,
+    pub replication_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +378,7 @@ pub enum Response {
     GroupAck,
     CommittedOffset(Option<u64>),
     Topics(Vec<TopicMetadata>),
+    ClusterMetadata(ClusterMetadata),
     Error(String),
 }
 
@@ -474,6 +494,7 @@ pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, Protocol
             validate_topic(&topic)?;
             Ok(Some(Request::DescribeTopic(topic)))
         }
+        CLUSTER_METADATA if !frame.has_remaining() => Ok(Some(Request::ClusterMetadata)),
         value => Err(ProtocolError::UnknownOpcode(value)),
     }
 }
@@ -498,6 +519,11 @@ pub fn encode_request(request: &Request, buffer: &mut BytesMut) -> Result<(), Pr
         Request::DescribeTopic(topic) => {
             validate_topic(topic)?;
             encode_string_request(DESCRIBE_TOPIC, [topic], buffer).map(|_| ())
+        }
+        Request::ClusterMetadata => {
+            buffer.put_u32(1);
+            buffer.put_u8(CLUSTER_METADATA);
+            Ok(())
         }
     }
 }
@@ -563,6 +589,26 @@ pub fn encode_response(response: &Response, buffer: &mut BytesMut) -> Result<(),
             for topic in topics {
                 encode_string(&topic.topic, buffer)?;
                 buffer.put_u32(topic.partitions);
+            }
+            set_frame_len(buffer, start)
+        }
+        Response::ClusterMetadata(metadata) => {
+            if metadata.nodes.is_empty() || metadata.nodes.len() > MAX_CLUSTER_NODES {
+                return Err(ProtocolError::InvalidClusterMetadata);
+            }
+            let start = buffer.len();
+            buffer.put_u32(0);
+            buffer.put_u8(CLUSTER_METADATA_RESPONSE);
+            buffer.put_u32(metadata.responding_broker_id);
+            buffer.put_u32(
+                u32::try_from(metadata.nodes.len()).map_err(|_| ProtocolError::FrameTooLarge)?,
+            );
+            for node in &metadata.nodes {
+                buffer.put_u32(node.id);
+                encode_string(&node.host, buffer)?;
+                buffer.put_u16(node.port);
+                buffer.put_u16(node.admin_port);
+                buffer.put_u16(node.replication_port);
             }
             set_frame_len(buffer, start)
         }
@@ -662,6 +708,9 @@ pub fn decode_response(buffer: &mut BytesMut) -> Result<Option<Response>, Protoc
         TOPICS_RESPONSE => {
             decode_topics_response(frame).map(|topics| Some(Response::Topics(topics)))
         }
+        CLUSTER_METADATA_RESPONSE => {
+            decode_cluster_metadata(frame).map(|metadata| Some(Response::ClusterMetadata(metadata)))
+        }
         ERROR_RESPONSE => {
             let message = decode_string(&mut frame)?;
             ensure_empty(&frame)?;
@@ -685,6 +734,34 @@ fn decode_topics_response(mut frame: BytesMut) -> Result<Vec<TopicMetadata>, Pro
     }
     ensure_empty(&frame)?;
     Ok(topics)
+}
+
+fn decode_cluster_metadata(mut frame: BytesMut) -> Result<ClusterMetadata, ProtocolError> {
+    ensure_remaining(&frame, 8)?;
+    let responding_broker_id = frame.get_u32();
+    let count = read_u32_len(&mut frame)?;
+    if count == 0 || count > MAX_CLUSTER_NODES {
+        return Err(ProtocolError::InvalidClusterMetadata);
+    }
+    let mut nodes = Vec::with_capacity(count);
+    for _ in 0..count {
+        ensure_remaining(&frame, 4)?;
+        let id = frame.get_u32();
+        let host = decode_string(&mut frame)?;
+        ensure_remaining(&frame, 6)?;
+        nodes.push(ClusterNode {
+            id,
+            host,
+            port: frame.get_u16(),
+            admin_port: frame.get_u16(),
+            replication_port: frame.get_u16(),
+        });
+    }
+    ensure_empty(&frame)?;
+    Ok(ClusterMetadata {
+        responding_broker_id,
+        nodes,
+    })
 }
 
 fn decode_produce(mut frame: BytesMut) -> Result<ProduceRequest, ProtocolError> {
@@ -1294,6 +1371,8 @@ pub enum ProtocolError {
     InvalidCompressedBatch,
     #[error("topic partition count must be greater than zero")]
     InvalidPartitionCount,
+    #[error("cluster metadata is empty or exceeds the node limit")]
+    InvalidClusterMetadata,
 }
 
 #[cfg(test)]
@@ -1302,9 +1381,10 @@ mod tests {
     use bytes::{BufMut, Bytes, BytesMut};
 
     use super::{
-        AckMode, BatchRecord, Compression, CreateTopicRequest, FetchRequest, FetchResponse,
-        FetchedRecord, MAX_FRAME_SIZE, ProduceBatchRequest, ProduceRequest, ProtocolError, Request,
-        Response, TopicMetadata, decode_request, decode_response, encode_request, encode_response,
+        AckMode, BatchRecord, ClusterMetadata, ClusterNode, Compression, CreateTopicRequest,
+        FetchRequest, FetchResponse, FetchedRecord, MAX_FRAME_SIZE, ProduceBatchRequest,
+        ProduceRequest, ProtocolError, Request, Response, TopicMetadata, decode_request,
+        decode_response, encode_request, encode_response,
     };
 
     fn produce_request() -> Request {
@@ -1405,6 +1485,33 @@ mod tests {
         encode_response(&response, &mut encoded).expect("topics response should encode");
         assert_eq!(
             decode_response(&mut encoded).expect("topics response should decode"),
+            Some(response)
+        );
+    }
+
+    #[test]
+    fn round_trips_cluster_metadata() {
+        let mut encoded = BytesMut::new();
+        encode_request(&Request::ClusterMetadata, &mut encoded)
+            .expect("cluster request should encode");
+        assert_eq!(
+            decode_request(&mut encoded).expect("cluster request should decode"),
+            Some(Request::ClusterMetadata)
+        );
+
+        let response = Response::ClusterMetadata(ClusterMetadata {
+            responding_broker_id: 2,
+            nodes: vec![ClusterNode {
+                id: 2,
+                host: "127.0.0.1".to_owned(),
+                port: 7500,
+                admin_port: 7501,
+                replication_port: 7502,
+            }],
+        });
+        encode_response(&response, &mut encoded).expect("cluster response should encode");
+        assert_eq!(
+            decode_response(&mut encoded).expect("cluster response should decode"),
             Some(response)
         );
     }

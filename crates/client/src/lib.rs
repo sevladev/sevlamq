@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
 use sevlamq_protocol::{
-    AckMode, CommitOffsetRequest, CreateTopicRequest, FetchCommittedOffsetRequest, FetchRequest,
-    FetchResponse, GroupFetchRequest, GroupGenerationRequest, GroupMemberRequest,
+    AckMode, ClusterMetadata, CommitOffsetRequest, CreateTopicRequest, FetchCommittedOffsetRequest,
+    FetchRequest, FetchResponse, GroupFetchRequest, GroupGenerationRequest, GroupMemberRequest,
     JoinGroupResponse, ProduceAck, ProduceBatchRequest, ProduceRequest, ProducerIdentity, Request,
     Response, TopicMetadata, decode_response, encode_request,
 };
@@ -83,6 +83,13 @@ impl Client {
     pub async fn describe_topic(&mut self, topic: String) -> Result<TopicMetadata, ClientError> {
         match self.request(Request::DescribeTopic(topic)).await? {
             Response::Topics(mut topics) if topics.len() == 1 => Ok(topics.remove(0)),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn cluster_metadata(&mut self) -> Result<ClusterMetadata, ClientError> {
+        match self.request(Request::ClusterMetadata).await? {
+            Response::ClusterMetadata(metadata) => Ok(metadata),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

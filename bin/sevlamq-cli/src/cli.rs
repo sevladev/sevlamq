@@ -61,6 +61,11 @@ pub enum Command {
         #[command(subcommand)]
         command: TopicCommand,
     },
+    /// Inspects static cluster membership.
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
     /// Runs a coordinated consumer with automatic heartbeat and commits.
     Consume {
         topic: String,
@@ -175,12 +180,17 @@ pub enum TopicCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ClusterCommand {
+    Status,
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use clap::Parser;
 
-    use super::{BatchCompression, Cli, Command, GroupCommand, TopicCommand};
+    use super::{BatchCompression, Cli, ClusterCommand, Command, GroupCommand, TopicCommand};
 
     #[test]
     fn parses_produce_command() {
@@ -257,6 +267,18 @@ mod tests {
                     partitions: 6,
                 }
             } if topic == "orders"
+        ));
+    }
+
+    #[test]
+    fn parses_cluster_status() {
+        let cli = Cli::try_parse_from(["sevlamq", "cluster", "status"])
+            .expect("cluster status should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Cluster {
+                command: ClusterCommand::Status
+            }
         ));
     }
 
