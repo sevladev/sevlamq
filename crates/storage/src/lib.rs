@@ -310,6 +310,30 @@ impl PartitionLog {
         Ok(offset)
     }
 
+    pub fn append_replica(&mut self, offset: u64, record: &Record) -> Result<u64, StorageError> {
+        if offset < self.next_offset {
+            let existing = self
+                .read(offset, MAX_RECORD_SIZE)?
+                .into_iter()
+                .find(|existing| existing.offset == offset)
+                .ok_or(StorageError::ReplicaDiverged(offset))?;
+            if existing.timestamp_ms == record.timestamp_ms
+                && existing.key == record.key
+                && existing.value == record.value
+            {
+                return Ok(offset);
+            }
+            return Err(StorageError::ReplicaDiverged(offset));
+        }
+        if offset != self.next_offset {
+            return Err(StorageError::UnexpectedOffset {
+                expected: self.next_offset,
+                actual: offset,
+            });
+        }
+        self.append(record)
+    }
+
     pub fn flush(&mut self) -> Result<(), StorageError> {
         self.active_file.flush()?;
         self.active_index_file.flush()?;
@@ -825,6 +849,8 @@ pub enum StorageError {
     OffsetOverflow,
     #[error("expected offset {expected}, found {actual}")]
     UnexpectedOffset { expected: u64, actual: u64 },
+    #[error("replica content diverges at offset {0}")]
+    ReplicaDiverged(u64),
     #[error("segment size limit must be greater than zero")]
     InvalidSegmentLimit,
     #[error("index interval must be greater than zero")]
@@ -859,7 +885,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        INDEX_ENTRY_SIZE, PartitionLog, ProducerIdentity, Record, decode_record,
+        INDEX_ENTRY_SIZE, PartitionLog, ProducerIdentity, Record, StorageError, decode_record,
         discover_partitions,
     };
 
@@ -919,6 +945,38 @@ mod tests {
         assert_eq!(second.offset(), 1);
         assert_eq!(second.key(), None);
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn appends_replica_idempotently_and_rejects_gaps() {
+        let data_dir = tempdir().expect("temporary directory should be created");
+        let mut log = PartitionLog::open(data_dir.path(), "payments", 0, 1024, 64)
+            .expect("partition log should be created");
+        let record = Record::new(None, Bytes::from_static(b"hello"), 1_700_000_000_000);
+
+        assert_eq!(
+            log.append_replica(0, &record)
+                .expect("first replication should append"),
+            0
+        );
+        assert_eq!(
+            log.append_replica(0, &record)
+                .expect("repeated replication should deduplicate"),
+            0
+        );
+        assert_eq!(log.next_offset(), 1);
+        assert!(matches!(
+            log.append_replica(2, &record),
+            Err(StorageError::UnexpectedOffset {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        let divergent = Record::new(None, Bytes::from_static(b"world"), 1_700_000_000_000);
+        assert!(matches!(
+            log.append_replica(0, &divergent),
+            Err(StorageError::ReplicaDiverged(0))
+        ));
     }
 
     #[test]

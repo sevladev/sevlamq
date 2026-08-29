@@ -103,9 +103,15 @@ impl Config {
             if node.id == 0
                 || !ids.insert(node.id)
                 || !endpoints.insert((node.host.clone(), node.port))
-                || format!("{}:{}", node.host, node.port)
-                    .parse::<SocketAddr>()
-                    .is_err()
+                || !endpoints.insert((node.host.clone(), node.admin_port))
+                || !endpoints.insert((node.host.clone(), node.replication_port))
+                || [node.port, node.admin_port, node.replication_port]
+                    .into_iter()
+                    .any(|port| {
+                        format!("{}:{port}", node.host)
+                            .parse::<SocketAddr>()
+                            .is_err()
+                    })
             {
                 return Err(ConfigError::InvalidCluster);
             }

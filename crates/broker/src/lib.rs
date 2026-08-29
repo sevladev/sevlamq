@@ -13,8 +13,9 @@ use bytes::{Bytes, BytesMut};
 use sevlamq_common::Config;
 use sevlamq_protocol::{
     AckMode, BatchRecord, ClusterMetadata, ClusterNode, FetchResponse, FetchedRecord,
-    GroupFetchRequest, ProduceAck, Request, Response, TopicMetadata, decode_request,
-    encode_response,
+    GroupFetchRequest, ProduceAck, ReplicateAck, ReplicateRecord, Request, Response, TopicMetadata,
+    decode_replicate_ack, decode_replicate_record, decode_request, encode_replicate_ack,
+    encode_replicate_record, encode_response,
 };
 use sevlamq_storage::{
     PartitionLog, ProducerIdentity as StorageProducerIdentity, Record, discover_partitions,
@@ -73,6 +74,18 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
     let listener = TcpListener::bind(address).await?;
     let admin_address = config.admin.socket_addr()?;
     let admin_listener = TcpListener::bind(admin_address).await?;
+    let local_node = cluster
+        .nodes
+        .iter()
+        .find(|node| node.id == cluster.responding_broker_id)
+        .ok_or(BrokerError::InvalidClusterMetadata)?;
+    let replication_address: SocketAddr =
+        format!("{}:{}", local_node.host, local_node.replication_port).parse()?;
+    let replication_listener = TcpListener::bind(replication_address).await?;
+    let cluster_runtime = ClusterRuntime {
+        replicator: Replicator::new(Arc::clone(&cluster), Arc::clone(&metrics)),
+        metadata: Arc::clone(&cluster),
+    };
     let groups = GroupHandle::open(
         Path::new(&broker_config.data_dir),
         broker_config.default_partition_count,
@@ -86,14 +99,15 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
         groups.set_topic_partitions(&topic.topic, topic.partitions)?;
     }
 
-    info!(broker_id = cluster.responding_broker_id, %address, %admin_address, data_dir = %broker_config.data_dir, "broker started");
+    info!(broker_id = cluster.responding_broker_id, %address, %admin_address, %replication_address, data_dir = %broker_config.data_dir, "broker started");
     accept_connections(
         &listener,
         &admin_listener,
+        &replication_listener,
         storage.clone(),
         groups,
         metrics,
-        cluster,
+        cluster_runtime,
     )
     .await?;
     info!("shutdown signal received");
@@ -108,10 +122,11 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
 async fn accept_connections(
     listener: &TcpListener,
     admin_listener: &TcpListener,
+    replication_listener: &TcpListener,
     storage: StorageHandle,
     groups: GroupHandle,
     metrics: Arc<RuntimeMetrics>,
-    cluster: Arc<ClusterMetadata>,
+    cluster: ClusterRuntime,
 ) -> Result<(), BrokerError> {
     let mut connections = JoinSet::new();
 
@@ -124,11 +139,15 @@ async fn accept_connections(
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
                 let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-                connections.spawn(handle_connection(stream, peer, connection_id, storage.clone(), groups.clone(), Arc::clone(&metrics), Arc::clone(&cluster)));
+                connections.spawn(handle_connection(stream, peer, connection_id, storage.clone(), groups.clone(), Arc::clone(&metrics), cluster.clone()));
             }
             accepted = admin_listener.accept() => {
                 let (stream, _) = accepted?;
-                connections.spawn(handle_admin_connection(stream, storage.clone(), groups.clone(), Arc::clone(&metrics), Arc::clone(&cluster)));
+                connections.spawn(handle_admin_connection(stream, storage.clone(), groups.clone(), Arc::clone(&metrics), Arc::clone(&cluster.metadata)));
+            }
+            accepted = replication_listener.accept() => {
+                let (stream, peer) = accepted?;
+                connections.spawn(handle_replication_connection(stream, peer, storage.clone(), Arc::clone(&metrics)));
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 report_connection_result(result);
@@ -150,7 +169,7 @@ async fn handle_connection(
     storage: StorageHandle,
     groups: GroupHandle,
     metrics: Arc<RuntimeMetrics>,
-    cluster: Arc<ClusterMetadata>,
+    cluster: ClusterRuntime,
 ) -> Result<(), ConnectionError> {
     let mut read_buffer = BytesMut::with_capacity(8 * 1024);
     let mut write_buffer = BytesMut::with_capacity(128);
@@ -215,11 +234,11 @@ async fn process_request(
     metrics: &RuntimeMetrics,
     connection_id: u64,
     peer: SocketAddr,
-    cluster: &ClusterMetadata,
+    cluster: &ClusterRuntime,
 ) -> Result<Response, ConnectionError> {
     match request {
         Request::Produce(request) => {
-            if let Some(error) = leadership_error(cluster, request.partition()) {
+            if let Some(error) = leadership_error(&cluster.metadata, request.partition()) {
                 return Ok(error);
             }
             debug!(connection_id, %peer, topic = %request.topic(), "produce received");
@@ -235,14 +254,26 @@ async fn process_request(
                     }),
                 )
                 .await?;
+            let record = storage
+                .record_at(request.topic(), ack.partition, ack.offset)
+                .await?;
+            dispatch_replication(
+                storage.clone(),
+                cluster.replicator.clone(),
+                request.topic().to_owned(),
+                vec![(ack.partition, record)],
+                request.ack_mode(),
+            )
+            .await?;
             metrics.produced(1, request.payload().len());
             Ok(Response::ProduceAck(ack))
         }
         Request::ProduceBatch(request) => {
-            if let Some(error) = leadership_error(cluster, request.partition()) {
+            if let Some(error) = leadership_error(&cluster.metadata, request.partition()) {
                 return Ok(error);
             }
-            let response = produce_batch(storage, connection_id, peer, &request).await?;
+            let response =
+                produce_batch(storage, &cluster.replicator, connection_id, peer, &request).await?;
             metrics.produced(
                 request.records().len(),
                 request
@@ -254,7 +285,7 @@ async fn process_request(
             Ok(response)
         }
         Request::Fetch(request) => {
-            if let Some(error) = leadership_error(cluster, Some(request.partition())) {
+            if let Some(error) = leadership_error(&cluster.metadata, Some(request.partition())) {
                 return Ok(error);
             }
             let records = storage
@@ -273,7 +304,7 @@ async fn process_request(
             Ok(Response::Fetch(FetchResponse::new(records)))
         }
         Request::GroupFetch(request) => {
-            if let Some(error) = leadership_error(cluster, Some(request.partition)) {
+            if let Some(error) = leadership_error(&cluster.metadata, Some(request.partition)) {
                 return Ok(error);
             }
             let response = group_fetch(storage, groups, request).await?;
@@ -298,7 +329,7 @@ async fn process_request(
         | Request::ListTopics
         | Request::DescribeTopic(_)
         | Request::ClusterMetadata) => {
-            process_topic_request(request, storage, groups, cluster).await
+            process_topic_request(request, storage, groups, &cluster.metadata).await
         }
     }
 }
@@ -374,6 +405,146 @@ fn leader_for_partition(cluster: &ClusterMetadata, partition: u32) -> &ClusterNo
     &cluster.nodes[index]
 }
 
+#[derive(Clone)]
+struct ClusterRuntime {
+    metadata: Arc<ClusterMetadata>,
+    replicator: Replicator,
+}
+
+#[derive(Clone)]
+struct Replicator {
+    cluster: Arc<ClusterMetadata>,
+    metrics: Arc<RuntimeMetrics>,
+}
+
+impl Replicator {
+    const fn new(cluster: Arc<ClusterMetadata>, metrics: Arc<RuntimeMetrics>) -> Self {
+        Self { cluster, metrics }
+    }
+
+    async fn replicate(
+        &self,
+        storage: &StorageHandle,
+        topic: &str,
+        partition: u32,
+        record: &FetchedRecord,
+        ack_mode: AckMode,
+    ) -> Result<(), ConnectionError> {
+        for follower in self
+            .cluster
+            .nodes
+            .iter()
+            .filter(|node| node.id != self.cluster.responding_broker_id)
+        {
+            let request = ReplicateRecord {
+                topic: topic.to_owned(),
+                partition,
+                offset: record.offset,
+                timestamp_ms: record.timestamp_ms,
+                key: record.key.clone(),
+                value: record.value.clone(),
+                durable: ack_mode == AckMode::Durable,
+            };
+            let mut next_offset = send_replica(follower, &request).await?;
+            self.metrics.replication_sent(
+                follower.id,
+                topic,
+                partition,
+                next_offset,
+                next_offset == request.offset.saturating_add(1),
+            );
+            if next_offset > record.offset.saturating_add(1) {
+                return Err(ConnectionError::InvalidReplicationAck);
+            }
+            while next_offset <= record.offset {
+                let missing = storage.record_at(topic, partition, next_offset).await?;
+                let request = ReplicateRecord {
+                    topic: topic.to_owned(),
+                    partition,
+                    offset: missing.offset,
+                    timestamp_ms: missing.timestamp_ms,
+                    key: missing.key,
+                    value: missing.value,
+                    durable: ack_mode == AckMode::Durable,
+                };
+                next_offset = send_replica(follower, &request).await?;
+                self.metrics.replication_sent(
+                    follower.id,
+                    topic,
+                    partition,
+                    next_offset,
+                    next_offset == request.offset.saturating_add(1),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn send_replica(
+    follower: &ClusterNode,
+    request: &ReplicateRecord,
+) -> Result<u64, ConnectionError> {
+    let address = format!("{}:{}", follower.host, follower.replication_port);
+    let mut stream = TcpStream::connect(address).await?;
+    let mut buffer = BytesMut::new();
+    encode_replicate_record(request, &mut buffer)?;
+    stream.write_all(&buffer).await?;
+    buffer.clear();
+    loop {
+        if let Some(ack) = decode_replicate_ack(&mut buffer)? {
+            if ack.partition != request.partition {
+                return Err(ConnectionError::InvalidReplicationAck);
+            }
+            return Ok(ack.next_offset);
+        }
+        if stream.read_buf(&mut buffer).await? == 0 {
+            return Err(ConnectionError::ReplicationClosed);
+        }
+    }
+}
+
+async fn handle_replication_connection(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    storage: StorageHandle,
+    metrics: Arc<RuntimeMetrics>,
+) -> Result<(), ConnectionError> {
+    let mut read_buffer = BytesMut::with_capacity(8 * 1024);
+    let mut write_buffer = BytesMut::with_capacity(32);
+    loop {
+        if stream.read_buf(&mut read_buffer).await? == 0 {
+            if read_buffer.is_empty() {
+                return Ok(());
+            }
+            return Err(ConnectionError::TruncatedFrame);
+        }
+        while let Some(record) = decode_replicate_record(&mut read_buffer)? {
+            let expected = storage
+                .partition_offset(&record.topic, record.partition)
+                .await?;
+            let next_offset = if record.offset > expected {
+                expected
+            } else {
+                storage.replicate(record.clone()).await?
+            };
+            if next_offset > expected {
+                metrics.replication_received();
+            }
+            encode_replicate_ack(
+                ReplicateAck {
+                    partition: record.partition,
+                    next_offset,
+                },
+                &mut write_buffer,
+            )?;
+            stream.write_all(&write_buffer).await?;
+            write_buffer.clear();
+            debug!(%peer, topic = %record.topic, partition = record.partition, offset = record.offset, "record replicated");
+        }
+    }
+}
+
 struct ConnectionGuard(Arc<RuntimeMetrics>);
 
 impl Drop for ConnectionGuard {
@@ -384,6 +555,7 @@ impl Drop for ConnectionGuard {
 
 async fn produce_batch(
     storage: &StorageHandle,
+    replicator: &Replicator,
     connection_id: u64,
     peer: SocketAddr,
     request: &sevlamq_protocol::ProduceBatchRequest,
@@ -396,15 +568,73 @@ async fn produce_batch(
         compression = ?request.compression(),
         "produce batch received"
     );
-    storage
+    let acks = storage
         .append_batch(
             request.topic().to_owned(),
             request.partition(),
             request.records().to_vec(),
             request.ack_mode(),
         )
-        .await
-        .map(Response::ProduceBatchAck)
+        .await?;
+    let mut records = Vec::with_capacity(acks.len());
+    for ack in &acks {
+        records.push((
+            ack.partition,
+            storage
+                .record_at(request.topic(), ack.partition, ack.offset)
+                .await?,
+        ));
+    }
+    dispatch_replication(
+        storage.clone(),
+        replicator.clone(),
+        request.topic().to_owned(),
+        records,
+        request.ack_mode(),
+    )
+    .await?;
+    Ok(Response::ProduceBatchAck(acks))
+}
+
+async fn dispatch_replication(
+    storage: StorageHandle,
+    replicator: Replicator,
+    topic: String,
+    records: Vec<(u32, FetchedRecord)>,
+    ack_mode: AckMode,
+) -> Result<(), ConnectionError> {
+    if ack_mode == AckMode::Leader {
+        tokio::spawn(async move {
+            if let Err(error) =
+                replicate_records(&storage, &replicator, &topic, &records, ack_mode).await
+            {
+                replicator.metrics.replication_failed();
+                warn!(%error, %topic, "asynchronous replication failed");
+            }
+        });
+        Ok(())
+    } else {
+        let result = replicate_records(&storage, &replicator, &topic, &records, ack_mode).await;
+        if result.is_err() {
+            replicator.metrics.replication_failed();
+        }
+        result
+    }
+}
+
+async fn replicate_records(
+    storage: &StorageHandle,
+    replicator: &Replicator,
+    topic: &str,
+    records: &[(u32, FetchedRecord)],
+    ack_mode: AckMode,
+) -> Result<(), ConnectionError> {
+    for (partition, record) in records {
+        replicator
+            .replicate(storage, topic, *partition, record, ack_mode)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn group_fetch(
@@ -577,8 +807,38 @@ fn render_metrics(
         );
     }
     render_partition_metrics(&mut output, partitions);
+    render_replication_metrics(&mut output, metrics, partitions);
     render_group_metrics(&mut output, partitions, groups);
     output
+}
+
+fn render_replication_metrics(
+    output: &mut String,
+    metrics: &RuntimeMetrics,
+    partitions: &[PartitionSnapshot],
+) {
+    use std::fmt::Write as _;
+    output.push_str("# HELP sevlamq_replica_offset Next offset acknowledged by a follower.\n");
+    output.push_str("# TYPE sevlamq_replica_offset gauge\n");
+    output.push_str(
+        "# HELP sevlamq_replication_lag_records Records not yet acknowledged by a follower.\n",
+    );
+    output.push_str("# TYPE sevlamq_replication_lag_records gauge\n");
+    for (follower, topic, partition, offset) in metrics.replica_offsets() {
+        let high_watermark = partitions
+            .iter()
+            .find(|snapshot| snapshot.topic == topic && snapshot.partition == partition)
+            .map_or(0, |snapshot| snapshot.high_watermark);
+        let topic = observability::escape_label(&topic);
+        let labels =
+            format!("follower_id=\"{follower}\",topic=\"{topic}\",partition=\"{partition}\"");
+        let _ = writeln!(output, "sevlamq_replica_offset{{{labels}}} {offset}");
+        let _ = writeln!(
+            output,
+            "sevlamq_replication_lag_records{{{labels}}} {}",
+            high_watermark.saturating_sub(offset)
+        );
+    }
 }
 
 fn render_partition_metrics(output: &mut String, partitions: &[PartitionSnapshot]) {
@@ -1022,6 +1282,45 @@ impl StorageHandle {
             .map_err(|_| ConnectionError::StorageUnavailable)?
             .map_err(ConnectionError::Storage)
     }
+
+    async fn record_at(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<FetchedRecord, ConnectionError> {
+        self.read_once(topic, partition, offset, 16 * 1024 * 1024)
+            .await?
+            .into_iter()
+            .find(|record| record.offset == offset)
+            .ok_or(ConnectionError::MissingAppendedRecord)
+    }
+
+    async fn replicate(&self, record: ReplicateRecord) -> Result<u64, ConnectionError> {
+        let (reply, response) = oneshot::channel();
+        self.enqueue(StorageCommand::Replicate { record, reply })
+            .await?;
+        let next_offset = response
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?
+            .map_err(ConnectionError::Storage)?;
+        self.new_records.notify_waiters();
+        Ok(next_offset)
+    }
+
+    async fn partition_offset(&self, topic: &str, partition: u32) -> Result<u64, ConnectionError> {
+        let (reply, response) = oneshot::channel();
+        self.enqueue(StorageCommand::PartitionOffset {
+            topic: topic.to_owned(),
+            partition,
+            reply,
+        })
+        .await?;
+        response
+            .await
+            .map_err(|_| ConnectionError::StorageUnavailable)?
+            .map_err(ConnectionError::Storage)
+    }
 }
 
 enum StorageCommand {
@@ -1055,6 +1354,15 @@ enum StorageCommand {
         offset: u64,
         max_bytes: u32,
         reply: oneshot::Sender<Result<Vec<FetchedRecord>, sevlamq_storage::StorageError>>,
+    },
+    Replicate {
+        record: ReplicateRecord,
+        reply: oneshot::Sender<Result<u64, sevlamq_storage::StorageError>>,
+    },
+    PartitionOffset {
+        topic: String,
+        partition: u32,
+        reply: oneshot::Sender<Result<u64, sevlamq_storage::StorageError>>,
     },
     Snapshot {
         reply: oneshot::Sender<Vec<PartitionSnapshot>>,
@@ -1227,28 +1535,47 @@ fn run_storage_worker(
                     read_records(settings, logs, topics, &topic, partition, offset, max_bytes);
                 let _ = reply.send(result);
             }
+            StorageCommand::Replicate { record, reply } => {
+                let result = append_replica(logs, topics, record);
+                let _ = reply.send(result);
+            }
+            StorageCommand::PartitionOffset {
+                topic,
+                partition,
+                reply,
+            } => {
+                let result = logs
+                    .get(&(topic, partition))
+                    .map(PartitionLog::next_offset)
+                    .ok_or(sevlamq_storage::StorageError::UnknownPartition(partition));
+                let _ = reply.send(result);
+            }
             StorageCommand::Snapshot { reply } => {
-                let mut snapshots: Vec<_> = logs
-                    .iter()
-                    .map(|((topic, partition), log)| PartitionSnapshot {
-                        topic: topic.clone(),
-                        partition: *partition,
-                        high_watermark: log.next_offset(),
-                        low_watermark: log.low_watermark(),
-                        log_size_bytes: log.log_size_bytes(),
-                        segments: log.segments().len(),
-                    })
-                    .collect();
-                snapshots.sort_unstable_by(|left, right| {
-                    (&left.topic, left.partition).cmp(&(&right.topic, right.partition))
-                });
-                let _ = reply.send(snapshots);
+                let _ = reply.send(snapshot_logs(logs));
             }
             StorageCommand::ApplyRetention => {
                 apply_retention(settings, logs, metrics);
             }
         }
     }
+}
+
+fn snapshot_logs(logs: &PartitionLogs) -> Vec<PartitionSnapshot> {
+    let mut snapshots: Vec<_> = logs
+        .iter()
+        .map(|((topic, partition), log)| PartitionSnapshot {
+            topic: topic.clone(),
+            partition: *partition,
+            high_watermark: log.next_offset(),
+            low_watermark: log.low_watermark(),
+            log_size_bytes: log.log_size_bytes(),
+            segments: log.segments().len(),
+        })
+        .collect();
+    snapshots.sort_unstable_by(|left, right| {
+        (&left.topic, left.partition).cmp(&(&right.topic, right.partition))
+    });
+    snapshots
 }
 
 fn apply_retention(settings: &StorageSettings, logs: &mut PartitionLogs, metrics: &RuntimeMetrics) {
@@ -1357,6 +1684,31 @@ fn append_record(
         metrics.observe_flush(flush_started.elapsed());
     }
     Ok(ProduceAck { partition, offset })
+}
+
+fn append_replica(
+    logs: &mut PartitionLogs,
+    topics: &HashMap<String, u32>,
+    replicated: ReplicateRecord,
+) -> Result<u64, sevlamq_storage::StorageError> {
+    let partition_count = topics
+        .get(&replicated.topic)
+        .copied()
+        .ok_or(sevlamq_storage::StorageError::UnknownTopic)?;
+    if replicated.partition >= partition_count {
+        return Err(sevlamq_storage::StorageError::UnknownPartition(
+            replicated.partition,
+        ));
+    }
+    let log = logs
+        .get_mut(&(replicated.topic, replicated.partition))
+        .ok_or(sevlamq_storage::StorageError::InvalidTopic)?;
+    let record = Record::new(replicated.key, replicated.value, replicated.timestamp_ms);
+    log.append_replica(replicated.offset, &record)?;
+    if replicated.durable {
+        log.sync_data()?;
+    }
+    Ok(log.next_offset())
 }
 
 fn append_batch_records(
@@ -1558,6 +1910,8 @@ pub enum BrokerError {
     Config(#[from] sevlamq_common::ConfigError),
     #[error("broker I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("invalid replication address: {0}")]
+    ReplicationAddress(#[from] std::net::AddrParseError),
     #[error(transparent)]
     Storage(#[from] sevlamq_storage::StorageError),
     #[error("storage worker failed: {0}")]
@@ -1570,6 +1924,8 @@ pub enum BrokerError {
     InvalidStorageQueueConfig,
     #[error("storage worker is unavailable during broker startup")]
     StorageUnavailable,
+    #[error("local broker is missing from cluster metadata")]
+    InvalidClusterMetadata,
     #[error(
         "topic {topic} has partition {partition}, outside configured partition count {partition_count}"
     )]
@@ -1594,6 +1950,12 @@ enum ConnectionError {
     StorageUnavailable,
     #[error("broker busy: storage queue timeout")]
     BrokerBusy,
+    #[error("replication connection closed before acknowledgement")]
+    ReplicationClosed,
+    #[error("follower returned an invalid replication acknowledgement")]
+    InvalidReplicationAck,
+    #[error("newly appended record could not be read back")]
+    MissingAppendedRecord,
 }
 
 #[cfg(test)]
@@ -1613,9 +1975,10 @@ mod tests {
     };
 
     use super::{
-        ConnectionError, GroupHandle, PartitionSnapshot, RuntimeMetrics, StorageCommand,
-        StorageHandle, StorageSettings, handle_connection, leader_for_partition, leadership_error,
-        render_metrics, select_partition, start_storage_worker,
+        ClusterRuntime, ConnectionError, GroupHandle, PartitionSnapshot, Replicator,
+        RuntimeMetrics, StorageCommand, StorageHandle, StorageSettings, handle_connection,
+        leader_for_partition, leadership_error, render_metrics, select_partition,
+        start_storage_worker,
     };
 
     fn test_storage_settings(data_dir: &std::path::Path, partitions: u32) -> StorageSettings {
@@ -1895,6 +2258,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catches_up_a_follower_without_creating_offset_gaps() {
+        let leader_dir = tempdir().expect("leader directory should be created");
+        let follower_dir = tempdir().expect("follower directory should be created");
+        let (leader, leader_worker) = start_storage_worker(
+            test_storage_settings(leader_dir.path(), 1),
+            Arc::new(RuntimeMetrics::default()),
+        )
+        .await
+        .expect("leader storage should start");
+        let (follower, follower_worker) = start_storage_worker(
+            test_storage_settings(follower_dir.path(), 1),
+            Arc::new(RuntimeMetrics::default()),
+        )
+        .await
+        .expect("follower storage should start");
+        leader
+            .create_topic("payments".to_owned(), 1)
+            .await
+            .expect("leader topic should be created");
+        follower
+            .create_topic("payments".to_owned(), 1)
+            .await
+            .expect("follower topic should be created");
+        for value in ["first", "second", "third"] {
+            leader
+                .append(
+                    "payments".to_owned(),
+                    Some(0),
+                    Bytes::new(),
+                    Bytes::from(value.to_owned()),
+                    AckMode::Durable,
+                    None,
+                )
+                .await
+                .expect("leader append should succeed");
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("replication listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("replication listener should have an address");
+        let follower_server = follower.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (stream, peer) = listener.accept().await.expect("replica should connect");
+                super::handle_replication_connection(
+                    stream,
+                    peer,
+                    follower_server.clone(),
+                    Arc::new(RuntimeMetrics::default()),
+                )
+                .await
+                .expect("replication request should succeed");
+            }
+        });
+        let cluster = Arc::new(ClusterMetadata {
+            responding_broker_id: 1,
+            nodes: vec![
+                ClusterNode {
+                    id: 1,
+                    host: "127.0.0.1".to_owned(),
+                    port: 1,
+                    admin_port: 2,
+                    replication_port: 3,
+                },
+                ClusterNode {
+                    id: 2,
+                    host: "127.0.0.1".to_owned(),
+                    port: 4,
+                    admin_port: 5,
+                    replication_port: address.port(),
+                },
+            ],
+        });
+        let replicator = Replicator::new(cluster, Arc::new(RuntimeMetrics::default()));
+        let latest = leader
+            .record_at("payments", 0, 2)
+            .await
+            .expect("latest leader record should exist");
+
+        replicator
+            .replicate(&leader, "payments", 0, &latest, AckMode::Durable)
+            .await
+            .expect("follower should catch up");
+        server.await.expect("replication server should finish");
+        let records = follower
+            .read_once("payments", 0, 0, 1024)
+            .await
+            .expect("follower records should be readable");
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[2].offset, 2);
+
+        drop(leader);
+        drop(follower);
+        leader_worker
+            .await
+            .expect("leader worker should finish")
+            .expect("leader storage should close");
+        follower_worker
+            .await
+            .expect("follower worker should finish")
+            .expect("follower storage should close");
+    }
+
+    #[tokio::test]
     async fn fetches_an_empty_partition_before_the_first_produce() {
         let data_dir = tempdir().expect("temporary directory should be created");
         let (storage, storage_worker) = start_storage_worker(
@@ -1946,7 +2416,13 @@ mod tests {
                     connection_storage,
                     groups,
                     Arc::new(RuntimeMetrics::default()),
-                    test_cluster(),
+                    ClusterRuntime {
+                        metadata: test_cluster(),
+                        replicator: Replicator::new(
+                            test_cluster(),
+                            Arc::new(RuntimeMetrics::default()),
+                        ),
+                    },
                 )
                 .await
             });

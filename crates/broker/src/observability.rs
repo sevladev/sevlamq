@@ -1,5 +1,9 @@
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    collections::HashMap,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -70,6 +74,10 @@ pub struct RuntimeMetrics {
     fetched_bytes: AtomicU64,
     broker_busy: AtomicU64,
     retention_segments_removed: AtomicU64,
+    replication_records_sent: AtomicU64,
+    replication_records_received: AtomicU64,
+    replication_failures: AtomicU64,
+    replica_offsets: Mutex<HashMap<(u32, String, u32), u64>>,
     produce_latency: Histogram,
     fetch_latency: Histogram,
     append_latency: Histogram,
@@ -112,6 +120,46 @@ impl RuntimeMetrics {
             u64::try_from(segments).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+    }
+
+    pub fn replication_sent(
+        &self,
+        follower_id: u32,
+        topic: &str,
+        partition: u32,
+        next_offset: u64,
+        record_accepted: bool,
+    ) {
+        if record_accepted {
+            self.replication_records_sent
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if let Ok(mut offsets) = self.replica_offsets.lock() {
+            offsets.insert((follower_id, topic.to_owned(), partition), next_offset);
+        }
+    }
+
+    pub fn replication_received(&self) {
+        self.replication_records_received
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn replication_failed(&self) {
+        self.replication_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn replica_offsets(&self) -> Vec<(u32, String, u32, u64)> {
+        self.replica_offsets.lock().map_or_else(
+            |_| Vec::new(),
+            |offsets| {
+                offsets
+                    .iter()
+                    .map(|((broker, topic, partition), offset)| {
+                        (*broker, topic.clone(), *partition, *offset)
+                    })
+                    .collect()
+            },
+        )
     }
 
     pub fn observe_produce(&self, duration: Duration) {
@@ -179,6 +227,27 @@ impl RuntimeMetrics {
             "Closed log segments removed by retention.",
             "counter",
             self.retention_segments_removed.load(Ordering::Relaxed),
+        );
+        metric(
+            output,
+            "sevlamq_replication_records_sent_total",
+            "Records acknowledged by followers.",
+            "counter",
+            self.replication_records_sent.load(Ordering::Relaxed),
+        );
+        metric(
+            output,
+            "sevlamq_replication_records_received_total",
+            "Records accepted through the replication listener.",
+            "counter",
+            self.replication_records_received.load(Ordering::Relaxed),
+        );
+        metric(
+            output,
+            "sevlamq_replication_failures_total",
+            "Replication operations that failed before acknowledgement.",
+            "counter",
+            self.replication_failures.load(Ordering::Relaxed),
         );
         self.produce_latency.render(
             output,

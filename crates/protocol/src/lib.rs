@@ -34,6 +34,8 @@ const DESCRIBE_TOPIC: u8 = 0x32;
 const TOPICS_RESPONSE: u8 = 0x33;
 const CLUSTER_METADATA: u8 = 0x40;
 const CLUSTER_METADATA_RESPONSE: u8 = 0x41;
+const REPLICATE_RECORD: u8 = 0x50;
+const REPLICATE_ACK: u8 = 0x51;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -78,6 +80,109 @@ pub struct TopicMetadata {
     pub topic: String,
     pub partitions: u32,
     pub leaders: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicateRecord {
+    pub topic: String,
+    pub partition: u32,
+    pub offset: u64,
+    pub timestamp_ms: u64,
+    pub key: Option<Bytes>,
+    pub value: Bytes,
+    pub durable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicateAck {
+    pub partition: u32,
+    pub next_offset: u64,
+}
+
+pub fn encode_replicate_record(
+    record: &ReplicateRecord,
+    buffer: &mut BytesMut,
+) -> Result<(), ProtocolError> {
+    validate_topic(&record.topic)?;
+    let key_len = record.key.as_ref().map_or(0, Bytes::len);
+    validate_size(key_len, MAX_KEY_SIZE, ProtocolError::KeyTooLarge)?;
+    validate_size(
+        record.value.len(),
+        MAX_MESSAGE_SIZE,
+        ProtocolError::MessageTooLarge,
+    )?;
+    let start = buffer.len();
+    buffer.put_u32(0);
+    buffer.put_u8(REPLICATE_RECORD);
+    encode_string(&record.topic, buffer)?;
+    buffer.put_u32(record.partition);
+    buffer.put_u64(record.offset);
+    buffer.put_u64(record.timestamp_ms);
+    buffer.put_u8(u8::from(record.durable));
+    buffer.put_u16(u16::try_from(key_len).map_err(|_| ProtocolError::KeyTooLarge)?);
+    if let Some(key) = &record.key {
+        buffer.extend_from_slice(key);
+    }
+    buffer.put_u32(u32::try_from(record.value.len()).map_err(|_| ProtocolError::MessageTooLarge)?);
+    buffer.extend_from_slice(&record.value);
+    set_frame_len(buffer, start)
+}
+
+pub fn decode_replicate_record(
+    buffer: &mut BytesMut,
+) -> Result<Option<ReplicateRecord>, ProtocolError> {
+    let Some(mut frame) = take_frame(buffer)? else {
+        return Ok(None);
+    };
+    if frame.get_u8() != REPLICATE_RECORD {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    let topic = decode_string(&mut frame)?;
+    ensure_remaining(&frame, 4 + 8 + 8 + 1 + 2)?;
+    let partition = frame.get_u32();
+    let offset = frame.get_u64();
+    let timestamp_ms = frame.get_u64();
+    let durable = frame.get_u8();
+    if durable > 1 {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    let key_len = read_u16_len(&mut frame)?;
+    let key = read_bytes(&mut frame, key_len)?;
+    let value_len = read_u32_len(&mut frame)?;
+    validate_size(value_len, MAX_MESSAGE_SIZE, ProtocolError::MessageTooLarge)?;
+    let value = read_bytes(&mut frame, value_len)?;
+    ensure_empty(&frame)?;
+    Ok(Some(ReplicateRecord {
+        topic,
+        partition,
+        offset,
+        timestamp_ms,
+        key: (!key.is_empty()).then_some(key),
+        value,
+        durable: durable == 1,
+    }))
+}
+
+pub fn encode_replicate_ack(ack: ReplicateAck, buffer: &mut BytesMut) -> Result<(), ProtocolError> {
+    let start = buffer.len();
+    buffer.put_u32(0);
+    buffer.put_u8(REPLICATE_ACK);
+    buffer.put_u32(ack.partition);
+    buffer.put_u64(ack.next_offset);
+    set_frame_len(buffer, start)
+}
+
+pub fn decode_replicate_ack(buffer: &mut BytesMut) -> Result<Option<ReplicateAck>, ProtocolError> {
+    let Some(mut frame) = take_frame(buffer)? else {
+        return Ok(None);
+    };
+    if frame.remaining() != 1 + 4 + 8 || frame.get_u8() != REPLICATE_ACK {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    Ok(Some(ReplicateAck {
+        partition: frame.get_u32(),
+        next_offset: frame.get_u64(),
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +569,29 @@ pub struct FetchedRecord {
     pub timestamp_ms: u64,
     pub key: Option<Bytes>,
     pub value: Bytes,
+}
+
+fn take_frame(buffer: &mut BytesMut) -> Result<Option<BytesMut>, ProtocolError> {
+    if buffer.len() < FRAME_HEADER_SIZE {
+        return Ok(None);
+    }
+    let frame_len = usize::try_from(u32::from_be_bytes(
+        buffer[..FRAME_HEADER_SIZE]
+            .try_into()
+            .map_err(|_| ProtocolError::InvalidFrame)?,
+    ))
+    .map_err(|_| ProtocolError::FrameTooLarge)?;
+    if frame_len == 0 {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    if frame_len > MAX_FRAME_SIZE {
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    if buffer.len() < FRAME_HEADER_SIZE + frame_len {
+        return Ok(None);
+    }
+    buffer.advance(FRAME_HEADER_SIZE);
+    Ok(Some(buffer.split_to(frame_len)))
 }
 
 pub fn decode_request(buffer: &mut BytesMut) -> Result<Option<Request>, ProtocolError> {
@@ -1470,8 +1598,10 @@ mod tests {
     use super::{
         AckMode, BatchRecord, ClusterMetadata, ClusterNode, Compression, CreateTopicRequest,
         FetchRequest, FetchResponse, FetchedRecord, MAX_FRAME_SIZE, ProduceBatchRequest,
-        ProduceRequest, ProtocolError, Request, Response, TopicMetadata, decode_request,
-        decode_response, encode_request, encode_response,
+        ProduceRequest, ProtocolError, ReplicateAck, ReplicateRecord, Request, Response,
+        TopicMetadata, decode_replicate_ack, decode_replicate_record, decode_request,
+        decode_response, encode_replicate_ack, encode_replicate_record, encode_request,
+        encode_response,
     };
 
     fn produce_request() -> Request {
@@ -1603,6 +1733,35 @@ mod tests {
         assert_eq!(
             decode_response(&mut encoded).expect("cluster response should decode"),
             Some(response)
+        );
+    }
+
+    #[test]
+    fn round_trips_replication_frames() {
+        let record = ReplicateRecord {
+            topic: "payments".to_owned(),
+            partition: 1,
+            offset: 42,
+            timestamp_ms: 123_456,
+            key: Some(Bytes::from_static(b"customer-123")),
+            value: Bytes::from_static(b"hello"),
+            durable: true,
+        };
+        let mut buffer = BytesMut::new();
+        encode_replicate_record(&record, &mut buffer).expect("replication record should encode");
+        assert_eq!(
+            decode_replicate_record(&mut buffer).expect("replication record should decode"),
+            Some(record)
+        );
+
+        let ack = ReplicateAck {
+            partition: 1,
+            next_offset: 43,
+        };
+        encode_replicate_ack(ack, &mut buffer).expect("replication ack should encode");
+        assert_eq!(
+            decode_replicate_ack(&mut buffer).expect("replication ack should decode"),
+            Some(ack)
         );
     }
 
