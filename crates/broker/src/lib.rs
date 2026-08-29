@@ -10,6 +10,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use sevlamq_client::Client;
 use sevlamq_common::Config;
 use sevlamq_protocol::{
     AckMode, BatchRecord, ClusterMetadata, ClusterNode, FetchResponse, FetchedRecord,
@@ -100,7 +101,12 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
     }
 
     info!(broker_id = cluster.responding_broker_id, %address, %admin_address, %replication_address, data_dir = %broker_config.data_dir, "broker started");
-    accept_connections(
+    let recovery_worker = start_follower_recovery(
+        storage.clone(),
+        Arc::clone(&cluster_runtime.metadata),
+        Arc::clone(&metrics),
+    );
+    let accept_result = accept_connections(
         &listener,
         &admin_listener,
         &replication_listener,
@@ -109,7 +115,10 @@ pub async fn run(config: &Config) -> Result<(), BrokerError> {
         metrics,
         cluster_runtime,
     )
-    .await?;
+    .await;
+    recovery_worker.abort();
+    let _ = recovery_worker.await;
+    accept_result?;
     info!("shutdown signal received");
 
     drop(storage);
@@ -504,6 +513,77 @@ async fn send_replica(
     }
 }
 
+fn start_follower_recovery(
+    storage: StorageHandle,
+    cluster: Arc<ClusterMetadata>,
+    metrics: Arc<RuntimeMetrics>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let Ok(partitions) = storage.snapshot().await else {
+                metrics.replication_failed();
+                continue;
+            };
+            for partition in partitions {
+                let leader = leader_for_partition(&cluster, partition.partition);
+                if leader.id == cluster.responding_broker_id {
+                    continue;
+                }
+                metrics.replication_reconnect(leader.id, &partition.topic, partition.partition);
+                let result =
+                    recover_follower_partition(&storage, leader, &partition, &metrics).await;
+                if let Err(error) = result {
+                    metrics.replication_failed();
+                    metrics.replica_sync(leader.id, &partition.topic, partition.partition, false);
+                    debug!(%error, leader_id = leader.id, topic = %partition.topic, partition = partition.partition, "follower recovery retry scheduled");
+                }
+            }
+        }
+    })
+}
+
+async fn recover_follower_partition(
+    storage: &StorageHandle,
+    leader: &ClusterNode,
+    partition: &PartitionSnapshot,
+    metrics: &RuntimeMetrics,
+) -> Result<(), ConnectionError> {
+    let address: SocketAddr = format!("{}:{}", leader.host, leader.port).parse()?;
+    let mut client = Client::connect(address).await?;
+    let mut offset = partition.high_watermark;
+    loop {
+        let response = client
+            .fetch(
+                partition.topic.clone(),
+                partition.partition,
+                offset,
+                3 * 1024 * 1024,
+                0,
+            )
+            .await?;
+        if response.records().is_empty() {
+            metrics.replica_sync(leader.id, &partition.topic, partition.partition, true);
+            return Ok(());
+        }
+        for record in response.records() {
+            offset = storage
+                .replicate(ReplicateRecord {
+                    topic: partition.topic.clone(),
+                    partition: partition.partition,
+                    offset: record.offset,
+                    timestamp_ms: record.timestamp_ms,
+                    key: record.key.clone(),
+                    value: record.value.clone(),
+                    durable: true,
+                })
+                .await?;
+            metrics.replication_received();
+        }
+    }
+}
+
 async fn handle_replication_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -837,6 +917,16 @@ fn render_replication_metrics(
             output,
             "sevlamq_replication_lag_records{{{labels}}} {}",
             high_watermark.saturating_sub(offset)
+        );
+    }
+    output.push_str("# HELP sevlamq_replica_in_sync Whether this follower reached its leader.\n");
+    output.push_str("# TYPE sevlamq_replica_in_sync gauge\n");
+    for (leader, topic, partition, in_sync) in metrics.replica_sync_states() {
+        let topic = observability::escape_label(&topic);
+        let value = u8::from(in_sync);
+        let _ = writeln!(
+            output,
+            "sevlamq_replica_in_sync{{leader_id=\"{leader}\",topic=\"{topic}\",partition=\"{partition}\"}} {value}"
         );
     }
 }
@@ -1942,6 +2032,10 @@ enum ConnectionError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Protocol(#[from] sevlamq_protocol::ProtocolError),
+    #[error(transparent)]
+    Client(#[from] sevlamq_client::ClientError),
+    #[error("invalid broker address: {0}")]
+    Address(#[from] std::net::AddrParseError),
     #[error("connection closed with a partial frame")]
     TruncatedFrame,
     #[error(transparent)]

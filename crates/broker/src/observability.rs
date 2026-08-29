@@ -77,7 +77,9 @@ pub struct RuntimeMetrics {
     replication_records_sent: AtomicU64,
     replication_records_received: AtomicU64,
     replication_failures: AtomicU64,
+    replication_reconnects: AtomicU64,
     replica_offsets: Mutex<HashMap<(u32, String, u32), u64>>,
+    replica_sync: Mutex<HashMap<(u32, String, u32), bool>>,
     produce_latency: Histogram,
     fetch_latency: Histogram,
     append_latency: Histogram,
@@ -146,6 +148,37 @@ impl RuntimeMetrics {
 
     pub fn replication_failed(&self) {
         self.replication_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn replication_reconnect(&self, leader_id: u32, topic: &str, partition: u32) {
+        let was_out_of_sync = self.replica_sync.lock().is_ok_and(|replicas| {
+            replicas
+                .get(&(leader_id, topic.to_owned(), partition))
+                .is_some_and(|in_sync| !in_sync)
+        });
+        if was_out_of_sync {
+            self.replication_reconnects.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn replica_sync(&self, leader_id: u32, topic: &str, partition: u32, in_sync: bool) {
+        if let Ok(mut replicas) = self.replica_sync.lock() {
+            replicas.insert((leader_id, topic.to_owned(), partition), in_sync);
+        }
+    }
+
+    pub fn replica_sync_states(&self) -> Vec<(u32, String, u32, bool)> {
+        self.replica_sync.lock().map_or_else(
+            |_| Vec::new(),
+            |replicas| {
+                replicas
+                    .iter()
+                    .map(|((leader, topic, partition), in_sync)| {
+                        (*leader, topic.clone(), *partition, *in_sync)
+                    })
+                    .collect()
+            },
+        )
     }
 
     pub fn replica_offsets(&self) -> Vec<(u32, String, u32, u64)> {
@@ -248,6 +281,13 @@ impl RuntimeMetrics {
             "Replication operations that failed before acknowledgement.",
             "counter",
             self.replication_failures.load(Ordering::Relaxed),
+        );
+        metric(
+            output,
+            "sevlamq_replication_reconnects_total",
+            "Follower recovery retries after a failed connection.",
+            "counter",
+            self.replication_reconnects.load(Ordering::Relaxed),
         );
         self.produce_latency.render(
             output,
